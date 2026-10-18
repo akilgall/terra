@@ -37,6 +37,10 @@ and this project adheres to [Semantic Versioning][].
     `meta.n_positions`), e.g. those exported after multi-stream fine-tuning.
     `embed_dataset(..., trim_padding=True)` skips trailing padding, which
     speeds up embedding of cell-only records under a long layout.
+-   `terra.evaluation.alignment`: metrics for spatial / Tahoe-100M alignment
+    (domain mixing, paired-view similarity, per-drug separability and
+    cross-line consistency of drug shifts, cell-type retention, collapse
+    statistics) and `evaluate_alignment` to compute them all.
 
 ### Changed
 
@@ -44,6 +48,8 @@ and this project adheres to [Semantic Versioning][].
     `mps`, `cuda` or `cuda:N`. Integer GPU ids still work, and `-1` now
     reliably selects the CPU (it previously still picked CUDA when available).
 -   `DataLoader` memory pinning is applied only on CUDA, where it helps.
+-   `import terra.evaluation` no longer requires the `eval` extra; the
+    ligand-receptor helpers import `cellphonedb` / `omnipath` on first use.
 
 ### Fixed
 
