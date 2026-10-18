@@ -7,6 +7,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
+from .segment_layout import SegmentLayout, segment_gather_index
+
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,12 @@ class CellBaseDataset(Dataset):
                  pad_special_tokens: bool = False,
                  truncate_neighbors: bool = False,
                  tokenized_seq_len_cell: int | None = None,
+                 seq_len_neigh: int | None = None,
+                 tokenized_seq_len_neigh: int | None = None,
+                 centre_position_cap: int | None = None,
+                 token_column: str = 'gene_tokens',
+                 expr_column: str = 'gene_expr',
+                 nnz_column: str = 'n_nonzero_tokens',
                  ):
         """
         Torch CellBaseDataset class.
@@ -83,6 +91,19 @@ class CellBaseDataset(Dataset):
         sep_gene_tokens_neb:
             If `True`, use separate tokens for genes in neighborhood vs
             index cell.
+        seq_len_neigh:
+            Gene-token slots per neighbour. If set, the centre cell keeps
+            `seq_len_cell` slots and every neighbour `seq_len_neigh` slots
+            (asymmetric layout). `None` keeps the legacy uniform layout.
+        tokenized_seq_len_neigh:
+            Stored per-neighbour stride of the tokenized records (for
+            load-time truncation). Defaults to `seq_len_neigh`.
+        centre_position_cap:
+            If set, centre-cell positions are clamped to this value.
+        token_column, expr_column, nnz_column:
+            Dataset columns holding the gene tokens, gene expression and
+            number of non-zero tokens (e.g. the `*_panel` columns of a
+            panel-restricted view).
         """
         if gt_type not in ['rank', 'counts', 'combined']:
             raise ValueError(f'Invalid "gt_type": {gt_type}.')
@@ -126,12 +147,29 @@ class CellBaseDataset(Dataset):
         self.seq_len = (seq_len_cell +
                         seq_len_neighborhood +
                         self.n_special_tokens)
-        self.n_segments = (seq_len_cell + seq_len_neighborhood) / seq_len_cell
+        # Asymmetric/explicit layouts go through SegmentLayout; without the
+        # new kwargs the legacy uniform code paths run unchanged.
+        if seq_len_neigh is not None or tokenized_seq_len_neigh is not None:
+            self.layout = SegmentLayout.from_lengths(
+                seq_len_cell, seq_len_neighborhood,
+                seq_len_neigh=seq_len_neigh,
+                n_special_tokens=self.n_special_tokens)
+            self.n_segments = self.layout.n_segments
+        else:
+            self.layout = None
+            self.n_segments = (
+                seq_len_cell + seq_len_neighborhood) / seq_len_cell
+        self.tokenized_seq_len_neigh = (
+            tokenized_seq_len_neigh or
+            (self.layout.seq_len_neigh if self.layout else None))
+        self.centre_position_cap = centre_position_cap
+        self.token_column = token_column
+        self.expr_column = expr_column
         self.sampling_strategy = sampling_strategy
         if n_nonzero_tokens_list:
             self.n_nz_tokens = n_nonzero_tokens_list
         else:
-            self.n_nz_tokens = list(self.dataset['n_nonzero_tokens'])
+            self.n_nz_tokens = list(self.dataset[nnz_column])
         self.include_cell_id = include_cell_id
         self.sep_gene_tokens_neb = sep_gene_tokens_neb
         self.nz_spc = nz_spc
@@ -400,7 +438,77 @@ class CellBaseDataset(Dataset):
             sampled_rel_x_coords,
             sampled_rel_y_coords)
          
-    def _get_segment_seq(self, 
+    def _segment_bounds(self, segment: int) -> tuple[int, int]:
+        """Start/end slot of a 1-based segment in the stored record."""
+        if self.layout is None:
+            return (int((segment - 1) * self.seq_len_cell),
+                    int(segment * self.seq_len_cell))
+        bounds = self.layout.segment_slice(int(segment))
+        return bounds.start, bounds.stop
+
+    def _segment_len(self, segment: int) -> int:
+        """Gene-token slots of a 1-based segment."""
+        if self.layout is None:
+            return self.seq_len_cell
+        return self.layout.lengths[int(segment) - 1]
+
+    @staticmethod
+    def _pad_per_token(item: dict, length: int) -> dict:
+        """Right-pad per-token arrays (tokens, expression, segment ids) with
+        zeros to `length`; returns a new dict."""
+        padded = dict(item)
+        pad = length - len(item['gene_tokens'])
+        if pad > 0:
+            for key in ('gene_tokens', 'gene_expr', 'seg_tokens'):
+                if key in item:
+                    padded[key] = F.pad(item[key], (0, pad), value=0)
+        return padded
+
+    def _gather_layout(self, item: dict) -> dict:
+        """
+        Re-slice a stored record to `self.layout` (asymmetric path).
+
+        Keeps the top `seq_len_cell` centre genes and the top `seq_len_neigh`
+        genes of up to `n_neighs` neighbours, then pads to the layout length.
+        Records with fewer stored neighbours (e.g. cell-only records) get
+        empty neighbour slots. Returns a new dict.
+        """
+        centre_stride = self.tokenized_seq_len_cell
+        neigh_stride = self.tokenized_seq_len_neigh
+        item = self._pad_per_token(item, centre_stride)
+        n_tok = len(item['gene_tokens'])
+        if (n_tok - centre_stride) % neigh_stride != 0:
+            raise ValueError(
+                f"stored gene_tokens length {n_tok} does not match centre "
+                f"stride {centre_stride} plus whole neighbours of stride "
+                f"{neigh_stride}; set tokenized_seq_len_cell / "
+                "tokenized_seq_len_neigh to the stored strides.")
+        n_neigh_data = (n_tok - centre_stride) // neigh_stride
+        keep_neigh = min(self.layout.n_neighs, n_neigh_data)
+        idx = segment_gather_index(
+            stored_lengths=[centre_stride] + [neigh_stride] * n_neigh_data,
+            keep_lengths=[self.layout.seq_len_cell] +
+                         [self.layout.seq_len_neigh] * keep_neigh)
+        gathered = dict(item)
+        for key in ('gene_tokens', 'gene_expr', 'seg_tokens'):
+            if key in item:
+                gathered[key] = item[key][idx]
+        for key in ('rel_x_coord', 'rel_y_coord'):
+            if key in item:
+                gathered[key] = (item[key][idx] if len(item[key]) == n_tok
+                                 else item[key][:1 + keep_neigh])
+        return self._pad_per_token(gathered, self.layout.total)
+
+    def _expand_coord(self, coord: torch.Tensor) -> torch.Tensor:
+        """Per-segment coordinates -> one value per slot (layout path).
+        Missing trailing segments (no stored neighbour) get 0.0; their
+        slots are padding and are set to -inf later."""
+        missing = self.layout.n_segments - coord.numel()
+        if missing > 0:
+            coord = F.pad(coord, (0, missing), value=0.0)
+        return self.layout.expand_per_segment(coord)
+
+    def _get_segment_seq(self,
                          item: int,
                          segment: int,
                          segment_seq_len: int,
@@ -432,8 +540,8 @@ class CellBaseDataset(Dataset):
 
             # Only keep gene tokens, values, and coords of specified
             # segment
-            segment_start_idx = int((segment - 1) * self.seq_len_cell)
-            segment_end_idx = int(segment * self.seq_len_cell)
+            segment_start_idx, segment_end_idx = self._segment_bounds(
+                segment)
             segment_tokens = item['gene_tokens'][
                 segment_start_idx: segment_end_idx]
             if self.gt_type != 'rank':
@@ -534,6 +642,10 @@ class CellGraphDataset(CellBaseDataset):
 
         # Retrieve Hugging Face item once
         item = self.dataset[item]
+        if self.token_column != 'gene_tokens':
+            item['gene_tokens'] = item[self.token_column]
+        if self.expr_column != 'gene_expr' and self.expr_column in item:
+            item['gene_expr'] = item[self.expr_column]
 
         # TODO: add special tokens from token dict directly (1 value per row)
         item['tissue_token'] = torch.tensor([103])
@@ -557,7 +669,9 @@ class CellGraphDataset(CellBaseDataset):
         # Runs BEFORE coord expansion / seg_tokens reconstruction so all
         # per-cell arrays stay aligned. No-op when neither axis is reduced.
         stride = self.tokenized_seq_len_cell
-        if self.truncate_neighbors or stride != self.seq_len_cell:
+        if self.layout is not None:
+            item = self._gather_layout(item)
+        elif self.truncate_neighbors or stride != self.seq_len_cell:
             n_tok = len(item['gene_tokens'])
             if n_tok % stride != 0:
                 raise ValueError(
@@ -595,19 +709,29 @@ class CellGraphDataset(CellBaseDataset):
         # Expand spatial coordinates (TODO: if statement to support old API)
         if 'rel_x_coord' in item.keys():
             if len(item['rel_x_coord']) != len(item['gene_tokens']):
-                item['rel_x_coord'] = torch.repeat_interleave(
-                    item['rel_x_coord'], self.seq_len_cell)
-                item['rel_y_coord'] = torch.repeat_interleave(
-                    item['rel_y_coord'], self.seq_len_cell)
+                if self.layout is not None:
+                    item['rel_x_coord'] = self._expand_coord(
+                        item['rel_x_coord'])
+                    item['rel_y_coord'] = self._expand_coord(
+                        item['rel_y_coord'])
+                else:
+                    item['rel_x_coord'] = torch.repeat_interleave(
+                        item['rel_x_coord'], self.seq_len_cell)
+                    item['rel_y_coord'] = torch.repeat_interleave(
+                        item['rel_y_coord'], self.seq_len_cell)
 
         # Add segment to item (TODO: if statement to support old API)
         if 'seg_tokens' not in item.keys():
-            seg_tokens = torch.arange(1, self.n_segments + 1)
-            seg_tokens = torch.repeat_interleave(
-                seg_tokens, self.seq_len_cell)
-            # Mask out positions where gene_tokens == 0
-            seg_tokens = seg_tokens * (item['gene_tokens'] != 0).long()
-            item['seg_tokens'] = seg_tokens
+            if self.layout is not None:
+                item['seg_tokens'] = self.layout.segment_ids(
+                    item['gene_tokens'])
+            else:
+                seg_tokens = torch.arange(1, self.n_segments + 1)
+                seg_tokens = torch.repeat_interleave(
+                    seg_tokens, self.seq_len_cell)
+                # Mask out positions where gene_tokens == 0
+                seg_tokens = seg_tokens * (item['gene_tokens'] != 0).long()
+                item['seg_tokens'] = seg_tokens
 
         # Get (sampled) gene tokens, positions, segments, and values for
         # index cell segment
@@ -617,18 +741,21 @@ class CellGraphDataset(CellBaseDataset):
         item_dict['rel_y_coords'] = self._get_segment_seq(
             item=item,
             segment=1, # index cell segment
-            segment_seq_len=self.seq_len_cell)
+            segment_seq_len=self._segment_len(1))
 
         if self.gt_type == 'rank':
             del(item_dict['values'])
 
         segment_token_zero_mask = item_dict['tokens'].eq(0)
-            
+
         if self.gt_type != 'counts':
             item_dict['positions'] = torch.arange(
                 1, item_dict['tokens'].size(0) + 1, dtype=torch.long)
             item_dict['positions'][segment_token_zero_mask] = torch.tensor(
                 0, dtype=torch.long)
+            if self.centre_position_cap is not None:
+                item_dict['positions'] = item_dict['positions'].clamp(
+                    max=self.centre_position_cap)
         item_dict['segments'] = torch.ones_like(item_dict['tokens'])
         item_dict['segments'][segment_token_zero_mask] = torch.tensor(
             0, dtype=torch.long)
@@ -657,7 +784,7 @@ class CellGraphDataset(CellBaseDataset):
                 segment_rel_y_coords = self._get_segment_seq(
                     item=item,
                     segment=segment.item(),
-                    segment_seq_len=self.seq_len_cell)
+                    segment_seq_len=self._segment_len(segment.item()))
 
                 segment_zero_mask = segment_tokens.eq(0)
 
@@ -690,7 +817,8 @@ class CellGraphDataset(CellBaseDataset):
                     [item_dict['rel_y_coords'], segment_rel_y_coords], dim=0)
 
         current_len = item_dict['tokens'].size(0)
-        target_len = self.seq_len_cell + self.seq_len_neighborhood
+        target_len = (self.layout.total if self.layout is not None
+                      else self.seq_len_cell + self.seq_len_neighborhood)
 
         if current_len > target_len:
             # Truncate tokens
