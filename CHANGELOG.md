@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning][].
     gradient checkpointing and resume from a checkpoint. See
     `configs/finetune/tahoe_alignment.yaml`. Configs without `data.streams`
     run the existing loop unchanged.
+-   `embed_dataset`, `gene_embed_dataset` and `infer_token_distance` load
+    models whose config uses the asymmetric layout (`data.seq_len_neigh`,
+    `meta.n_positions`), e.g. those exported after multi-stream fine-tuning.
+    `embed_dataset(..., trim_padding=True)` skips trailing padding, which
+    speeds up embedding of cell-only records under a long layout.
 
 ### Changed
 

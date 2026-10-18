@@ -15,6 +15,8 @@ import torch
 
 __all__ = [
     "SegmentLayout",
+    "LayoutKwargs",
+    "config_layout_kwargs",
     "segment_gather_index",
 ]
 
@@ -240,3 +242,39 @@ def segment_gather_index(stored_lengths: Sequence[int],
         pieces.append(torch.arange(start, start + keep))
         start += stored
     return torch.cat(pieces) if pieces else torch.empty(0, dtype=torch.long)
+
+
+@dataclass(frozen=True)
+class LayoutKwargs:
+    """
+    Extra keyword arguments that a model config's layout adds.
+
+    For ``init_model``, the cell dataset, ``BlockMaskCollator`` and
+    ``create_binary_selection_mask`` respectively.
+    """
+
+    model: dict
+    dataset: dict
+    masker: dict
+    selection: dict
+
+
+def config_layout_kwargs(model_config: Mapping) -> LayoutKwargs:
+    """
+    Layout keyword arguments for code that rebuilds a model from its config.
+
+    Empty for legacy (uniform) configs, so their behaviour is unchanged.
+    Asymmetric configs (``data.seq_len_neigh``) pass the centre budget and the
+    per-neighbour budget; ``meta.n_positions`` sizes the position tables
+    independently of the sequence length.
+    """
+    data, meta = model_config["data"], model_config["meta"]
+    neigh = data.get("seq_len_neigh")
+    model = {} if neigh is None else {"seq_len_cell": data["seq_len_cell"]}
+    if meta.get("n_positions") is not None:
+        model = {**model, "n_positions": meta["n_positions"]}
+    dataset = {key: data[key] for key in ("seq_len_neigh", "tokenized_seq_len_neigh",
+                                          "centre_position_cap")
+               if data.get(key) is not None}
+    per_neigh = {} if neigh is None else {"seq_len_neigh": neigh}
+    return LayoutKwargs(model=model, dataset=dataset, masker=per_neigh, selection=per_neigh)

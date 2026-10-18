@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover - optional dependency
 from terra.utils.device import autocast, get_device, should_pin_memory
 from terra.utils.helper import init_model, load_checkpoint
 from terra.datasets.cell_datasets import init_cell_dataset
+from terra.datasets.segment_layout import config_layout_kwargs
 from terra.datasets.dataloaders import init_dataloader_and_sampler
 from terra.masks.block_masking import BlockMaskCollator
 
@@ -112,6 +113,7 @@ def _init_embed_inference_loader(
     Mirrors the loader-building block in ``embed.py`` (v9), including the
     ``special_token_pad_ratio`` argument of ``BlockMaskCollator``.
     """
+    layout_kwargs = config_layout_kwargs(model_config)
     mask_collator = BlockMaskCollator(
         n_targets=model_config['mask']['n_targets'],
         n_contexts=model_config['mask']['n_contexts'],
@@ -123,7 +125,8 @@ def _init_embed_inference_loader(
         sample_segments=False,
         sample_gene_masks=False,
         restrict_special_attention=model_config['meta']['restrict_special_attention'],
-        special_token_pad_ratio=1.0)
+        special_token_pad_ratio=1.0,
+        **layout_kwargs.masker)
 
     cell_dataset = init_cell_dataset(
         dataset=dataset,
@@ -137,7 +140,8 @@ def _init_embed_inference_loader(
         sampling_strategy=None,
         n_nonzero_tokens_list=[],
         include_cell_id=True,
-        sep_gene_tokens_neb=model_config['data']['sep_gene_tokens_neb'])
+        sep_gene_tokens_neb=model_config['data']['sep_gene_tokens_neb'],
+        **layout_kwargs.dataset)
 
     loader, _ = init_dataloader_and_sampler(
         cell_dataset=cell_dataset,
@@ -313,7 +317,8 @@ def infer_token_distance(
         predict_gene=model_config['meta']['predict_gene'],
         pos_learnable=model_config['meta']['pos_learnable'],
         nz_spc=model_config['data'].get('nz_spc', False),
-        mlp_bias=model_config['meta'].get('mlp_bias', True))
+        mlp_bias=model_config['meta'].get('mlp_bias', True),
+        **config_layout_kwargs(model_config).model)
 
     if model_config['meta']['api_version'] != 'v3':
         return_layer_emb_fn = target_encoder.return_layer_emb

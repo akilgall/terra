@@ -1,8 +1,6 @@
 """End-to-end smoke test of multi-stream alignment fine-tuning on a tiny bundle,
 plus LoRA merge scaling for the exported model."""
 
-import pickle
-
 import numpy as np
 import pytest
 import torch
@@ -11,7 +9,8 @@ import yaml
 datasets = pytest.importorskip("datasets")
 anndata = pytest.importorskip("anndata")
 
-from terra.tahoe.labels import DOMAIN_SPATIAL, DOMAIN_TAHOE, LabelCodes, add_value_columns  # noqa: E402
+from tiny_terra import NORMS, make_adata, make_bundle, tokenize  # noqa: E402
+
 from terra.tokenizers.cell_tokenizers import CellGraphTokenizer  # noqa: E402
 from terra.training.finetune_self_supervised import (  # noqa: E402
     finetune_self_supervised,
@@ -19,90 +18,13 @@ from terra.training.finetune_self_supervised import (  # noqa: E402
     prepare_finetuned_model,
 )
 from terra.training.lora import apply_lora  # noqa: E402
-from terra.training.multistream_finetune import ema_update, resolve_layout, resolve_n_positions, run_model_config  # noqa: E402
+from terra.training.multistream_finetune import (  # noqa: E402
+    ema_update,
+    resolve_layout,
+    resolve_n_positions,
+    run_model_config,
+)
 from terra.utils.helper import init_model  # noqa: E402
-
-N_GENES = 10
-NORMS = {"rank_cell_norm_method": None, "rank_gene_norm_method": None,
-         "rank_count_norm_method": None, "count_cell_norm_method": None,
-         "count_gene_norm_method": None, "count_count_norm_method": "shifted_log"}
-LINEAGE_MAP = {"lineages": {"lung": {"tahoe_organs": ["Lung"],
-                                     "spatial_cell_types": ["tumor"]}}}
-META = {"gt_type": "combined", "count_encoding": "mlp", "n_value_bins": 100,
-        "cell_pos_enc": "coord", "enc_emb_dim": 32, "enc_depth": 2, "pred_emb_dim": 16,
-        "pred_depth": 2, "num_heads": 4, "mlp_ratio": 2.0, "use_flash_attention": True,
-        "api_version": "v3", "predict_gene": True, "pos_learnable": False,
-        "special_tokens": [], "use_bfloat16": False, "restrict_special_attention": False}
-
-
-def _genes():
-    return [f"ENSG{i:011d}" for i in range(1, N_GENES + 1)]
-
-
-def _bundle(tmp_path):
-    """Tiny pretrained bundle: uniform 3 x 4 layout (seq_len 12)."""
-    folder = tmp_path / "bundle"
-    folder.mkdir()
-    token_dict = {"<pad>": 0, "<mask>": 1}
-    token_dict.update({g: i + 2 for i, g in enumerate(_genes())})
-    with open(folder / "token_dictionary.pkl", "wb") as f:
-        pickle.dump(token_dict, f)
-    with open(folder / "gene_count_dictionary.pkl", "wb") as f:
-        pickle.dump(dict.fromkeys(_genes()[:5], 100), f)
-    data = {"tokenizer_type": "cell_graph", "seq_len_cell": 4, "seq_len_neighborhood": 8,
-            "n_segments": 3, "n_neighs": 2, "model_input_size": 12,
-            "sep_gene_tokens_neb": False, **NORMS}
-    config = {"data": data, "meta": META,
-              "mask": {"n_targets": 1, "n_contexts": 1, "per_block_mask_ratio": 0.5}}
-    with open(folder / "model_config.yaml", "w") as f:
-        yaml.safe_dump(config, f)
-    torch.manual_seed(0)
-    encoder, predictor = init_model(
-        gt_type="combined", count_encoding="mlp", n_value_bins=100, cell_pos_enc="coord",
-        device="cpu", vocab_size=len(token_dict), seq_len=12, n_special_tokens=0,
-        n_segments=3, n_special_values=0, enc_emb_dim=32, enc_depth=2, pred_emb_dim=16,
-        pred_depth=2, num_heads=4, mlp_ratio=2.0, use_flash_attention=True,
-        api_version="v3", predict_gene=True, mlp_bias=True)
-    torch.save({"encoder": encoder.state_dict(), "predictor": predictor.state_dict(),
-                "target_encoder": encoder.state_dict(), "epoch": 1},
-               folder / "model_checkpoint.pt")
-    return folder
-
-
-def _adata(n_cells, spatial, seed):
-    rng = np.random.default_rng(seed)
-    adata = anndata.AnnData(X=rng.poisson(2.0, size=(n_cells, N_GENES)).astype(np.float32))
-    adata.var_names = _genes()
-    adata.var["ensembl_id"] = _genes()
-    adata.obs_names = [f"{'s' if spatial else 't'}{i}" for i in range(n_cells)]
-    adata.obs["cell_id"] = adata.obs_names.to_list()
-    if spatial:
-        adata.obsm["spatial"] = rng.uniform(0, 50, size=(n_cells, 2)).astype(np.float32)
-        adata.obs["cell_type"] = ["tumor", "fibroblast"] * (n_cells // 2)
-    else:
-        adata.obs["organ"] = "Lung"
-        adata.obs["is_control"] = [True, False] * (n_cells // 2)
-        adata.obs["drug"] = ["DMSO_TF", "Drug"] * (n_cells // 2)
-        adata.obs["dose_uM"] = [0.0, 0.5] * (n_cells // 2)
-        adata.obs["cell_line_id"] = "CVCL_0023"
-    return adata
-
-
-def _tokenized(bundle, adata, cell_only, out):
-    tk = CellGraphTokenizer(nproc=1, model_input_size=12, n_neighs=2,
-                            token_dictionary_file_path=str(bundle / "token_dictionary.pkl"),
-                            include_special_tokens=False, seq_len_cell=6, seq_len_neigh=3,
-                            cell_only=cell_only, **NORMS)
-    ds = tk._create_dataset(tk._tokenize_adata(adata=adata.copy()), use_generator=False)
-    codes = LabelCodes.from_values(LINEAGE_MAP, cell_lines=["CVCL_0023"], drugs=["DMSO_TF", "Drug"])
-    if cell_only:
-        ds = add_value_columns(ds, adata.obs, codes, LINEAGE_MAP, DOMAIN_TAHOE, "organ",
-                               "tahoe_organs")
-    else:
-        ds = add_value_columns(ds, adata.obs, codes, LINEAGE_MAP, DOMAIN_SPATIAL, "cell_type",
-                               "spatial_cell_types")
-    ds.save_to_disk(str(out))
-    return str(out)
 
 
 def _args(tmp_path, bundle, spatial_path, tahoe_path, use_peft=True, device="cpu"):
@@ -137,9 +59,9 @@ def _args(tmp_path, bundle, spatial_path, tahoe_path, use_peft=True, device="cpu
 
 @pytest.fixture
 def setup(tmp_path):
-    bundle = _bundle(tmp_path)
-    spatial = _tokenized(bundle, _adata(16, True, 0), False, tmp_path / "spatial_ds")
-    tahoe = _tokenized(bundle, _adata(16, False, 1), True, tmp_path / "tahoe_ds")
+    bundle = make_bundle(tmp_path / "bundle")
+    spatial = tokenize(bundle, make_adata(16, True, 0), False, tmp_path / "spatial_ds")
+    tahoe = tokenize(bundle, make_adata(16, False, 1), True, tmp_path / "tahoe_ds")
     return tmp_path, bundle, spatial, tahoe
 
 
@@ -334,11 +256,11 @@ def test_example_config_is_valid():
 
 
 def test_legacy_loop_still_trains_and_exports(tmp_path):
-    bundle = _bundle(tmp_path)
+    bundle = make_bundle(tmp_path / "bundle")
     tk = CellGraphTokenizer(nproc=1, model_input_size=12, n_neighs=2,
                             token_dictionary_file_path=str(bundle / "token_dictionary.pkl"),
                             include_special_tokens=False, **NORMS)
-    tk._create_dataset(tk._tokenize_adata(adata=_adata(16, True, 0)),
+    tk._create_dataset(tk._tokenize_adata(adata=make_adata(16, True, 0)),
                        use_generator=False).save_to_disk(str(tmp_path / "legacy_ds"))
     args = _args(tmp_path, bundle, "", "")
     args["data"] = {"finetune_dataset": [str(tmp_path / "legacy_ds")], "batch_size": 4,

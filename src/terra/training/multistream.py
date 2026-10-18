@@ -21,6 +21,7 @@ from datasets import concatenate_datasets, load_from_disk
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler
 
 from terra.masks.block_masking import BlockMaskCollator
+from terra.masks.utils import trim_trailing_pad
 
 __all__ = [
     "STREAM_KINDS",
@@ -213,17 +214,6 @@ class StreamBatch:
 
 def _attention(udata: dict) -> torch.Tensor:
     return (udata["tokens"] != 0).unsqueeze(1).unsqueeze(1)
-
-
-def trim_trailing_pad(udata: dict) -> dict:
-    """Cut every per-token tensor after the batch's last real token."""
-    tokens = udata["tokens"]
-    seq_len = tokens.shape[1]
-    real = tokens.ne(0).any(dim=0).nonzero()
-    cut = int(real.max()) + 1 if len(real) else 1
-    return {k: (v[:, :cut] if torch.is_tensor(v) and v.dim() == 2 and v.shape[1] == seq_len
-                else v)
-            for k, v in udata.items()}
 
 
 class MultiStreamCollator:

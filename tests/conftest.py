@@ -1,7 +1,14 @@
 """Shared pytest fixtures."""
 
+import sys
+from pathlib import Path
+
 import pytest
 import torch
+
+# Shared test helpers (e.g. ``tiny_terra``) live next to this file; with
+# ``--import-mode=importlib`` pytest does not put this directory on sys.path.
+sys.path.insert(0, str(Path(__file__).parent))
 
 
 def _available_devices() -> list[str]:

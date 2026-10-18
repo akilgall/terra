@@ -38,3 +38,20 @@ def apply_masks(x: torch.Tensor,
     if concat:
         all_x = torch.cat(all_x, dim=0)
     return all_x
+
+
+def trim_trailing_pad(udata: dict) -> dict:
+    """
+    Cut every per-token tensor after the batch's last real token.
+
+    Returns a new dict; tensors that are not (B, L) per-token fields are kept
+    as they are. Exact for the encoder: trailing padding is masked out of
+    attention and pooling anyway.
+    """
+    tokens = udata["tokens"]
+    seq_len = tokens.shape[1]
+    real = tokens.ne(0).any(dim=0).nonzero()
+    cut = int(real.max()) + 1 if len(real) else 1
+    return {k: (v[:, :cut] if torch.is_tensor(v) and v.dim() == 2 and v.shape[1] == seq_len
+                else v)
+            for k, v in udata.items()}
