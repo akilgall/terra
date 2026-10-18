@@ -5,13 +5,17 @@ One optimizer step sees one stream (see ``terra.training.multistream``):
 - ``spatial_full``: JEPA on cells with their neighbours.
 - ``spatial_cell_only``: JEPA on the same cells with neighbours hidden, plus
   view consistency between the online cell-only embedding and the target
-  encoder's full-view embedding. The target's cell-only embeddings fill a
-  per-lineage bank.
+  encoder's full-view embedding. The online cell-only embeddings (detached)
+  fill a per-lineage bank, so Tahoe cells are aligned to where spatial cells
+  are now rather than to the lagging EMA target.
 - ``cell_only`` (Tahoe-100M): JEPA, plus alignment of (control) cells to the
   bank of the same lineage, plus a variance term against collapse.
 
-Cell embeddings are means of layer-normed token embeddings: online over the
-context tokens, target over the centre cell's real tokens.
+Cell embeddings are means of the layer-normed embeddings of the centre cell's
+real tokens on the whole (unmasked) cell-only view, for the online and the
+target encoder alike: the representation `embed_dataset` returns, so the
+consistency and alignment terms train what inference uses. JEPA itself runs
+on the masked view.
 """
 
 from collections.abc import Callable
@@ -25,6 +29,7 @@ from terra.masks.utils import apply_masks
 from terra.training.losses import (
     EmbeddingBank,
     TermSchedule,
+    embedding_spread,
     jepa_loss,
     pool_centre,
     pool_tokens,
@@ -39,6 +44,9 @@ __all__ = ["TERMS", "StreamModels", "MultiStreamObjective"]
 TERMS = ("cell_only_jepa", "view_consistency", "alignment", "variance")
 DEFAULT_WEIGHTS = {"cell_only_jepa": 1.0, "view_consistency": 1.0, "alignment": 1.0,
                    "variance": 0.1}
+# Variance floor: about the per-dimension std of TERRA-96M whole-cell
+# embeddings. A higher floor (VICReg's 1.0) keeps inflating the embeddings.
+DEFAULT_GAMMA = 0.2
 
 
 @dataclass(frozen=True)
@@ -65,6 +73,17 @@ def target_cells(h: torch.Tensor, view: View) -> tuple[torch.Tensor, torch.Tenso
     """Centre-cell embeddings from target token embeddings, and row validity."""
     pooled, valid = pool_centre(h, view.udata["tokens"], view.udata["segments"])
     return pooled.float(), valid
+
+
+def online_cells(models: StreamModels, view: View) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Online-encoder centre-cell embeddings of the whole (unmasked) view.
+
+    The same pooling as `target_cells` and as the cell embeddings of
+    `embed_dataset`, so terms on these train what inference returns.
+    """
+    h, _ = models.encoder(batch=view.udata, masks_attention=view.attn)
+    return target_cells(_layer_norm(h), view)
 
 
 def online_jepa(models: StreamModels,
@@ -122,7 +141,7 @@ class MultiStreamObjective:
         self.control_only = bool(align.get("control_only", True))
         self.label_key = align.get("key", "lineage_value")
         self.control_key = align.get("control_key", "is_control_value")
-        self.gamma = float((cfg.get("variance") or {}).get("gamma", 1.0))
+        self.gamma = float((cfg.get("variance") or {}).get("gamma", DEFAULT_GAMMA))
         self.loss_fn_type = loss_fn_type
         self.bank = EmbeddingBank(int(align.get("bank_size", 1024)))
 
@@ -143,45 +162,53 @@ class MultiStreamObjective:
                  models: StreamModels,
                  epoch: float,
                  ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Total loss and its detached terms for one batch."""
+        """
+        Total loss, plus its detached terms and monitors for one batch.
+
+        Monitors (not part of the loss): `emb_std`, the spread of the online
+        cell embeddings (see `embedding_spread`), and for Tahoe batches
+        `align_lineages`, the number of lineages aligned.
+        """
         if batch.kind == "spatial_full":
             h = target_tokens(models.target_encoder, batch.jepa)
-            loss, _ = online_jepa(models, batch.jepa, h, self.loss_fn_type)
-            return loss, {"jepa": loss.item()}
-        extra = {}
+            loss, online = online_jepa(models, batch.jepa, h, self.loss_fn_type)
+            return loss, {"jepa": loss.item(), "emb_std": embedding_spread(online)}
         if batch.kind == "spatial_cell_only":
-            terms = self._spatial_cell_only(batch, models)
+            terms, extra = self._spatial_cell_only(batch, models)
         else:
-            terms, n_matched = self._cell_only(batch, models)
-            extra = {"align_lineages": float(n_matched)}
+            terms, extra = self._cell_only(batch, models)
         scheduled = self.weights(epoch)
         weights = {**scheduled, "jepa": scheduled["cell_only_jepa"]}
         loss = sum(weights[name] * value for name, value in terms.items())
         return loss, {**{name: value.item() for name, value in terms.items()}, **extra}
 
-    def _spatial_cell_only(self, batch: StreamBatch, models: StreamModels) -> dict:
+    def _spatial_cell_only(self, batch: StreamBatch, models: StreamModels) -> tuple[dict, dict]:
         full, full_valid = target_cells(target_tokens(models.target_encoder, batch.full),
                                         batch.full)
         h = target_tokens(models.target_encoder, batch.jepa)
-        bank_rows, bank_valid = target_cells(h, batch.jepa)
+        jepa, _ = online_jepa(models, batch.jepa, h, self.loss_fn_type)
+        cells, valid = online_cells(models, batch.jepa)
         labels = batch.jepa.udata[self.label_key]
-        self.bank.push(bank_rows[bank_valid], labels[bank_valid])
-        jepa, online = online_jepa(models, batch.jepa, h, self.loss_fn_type)
-        consistency = (view_consistency_loss(online[full_valid], full[full_valid])
-                       if full_valid.any() else online.sum() * 0.0)
-        return {"jepa": jepa, "view_consistency": consistency,
-                "variance": variance_loss(online, self.gamma)}
+        self.bank.push(cells[valid], labels[valid])
+        paired = valid & full_valid
+        consistency = (view_consistency_loss(cells[paired], full[paired])
+                       if paired.any() else cells.sum() * 0.0)
+        return ({"jepa": jepa, "view_consistency": consistency,
+                 "variance": variance_loss(cells[valid], self.gamma)},
+                {"emb_std": embedding_spread(cells[valid])})
 
-    def _cell_only(self, batch: StreamBatch, models: StreamModels) -> tuple[dict, int]:
+    def _cell_only(self, batch: StreamBatch, models: StreamModels) -> tuple[dict, dict]:
         h = target_tokens(models.target_encoder, batch.jepa)
-        jepa, online = online_jepa(models, batch.jepa, h, self.loss_fn_type)
+        jepa, _ = online_jepa(models, batch.jepa, h, self.loss_fn_type)
+        cells, valid = online_cells(models, batch.jepa)
         labels = batch.jepa.udata[self.label_key]
-        keep = (batch.jepa.udata[self.control_key].bool() if self.control_only
-                else torch.ones_like(labels, dtype=torch.bool))
+        keep = valid & (batch.jepa.udata[self.control_key].bool() if self.control_only
+                        else torch.ones_like(valid))
         align, n_matched = routed_alignment_loss(
-            online[keep], labels[keep], self.bank, self.min_cells, self.lambda_mean)
-        return {"jepa": jepa, "alignment": align,
-                "variance": variance_loss(online, self.gamma)}, n_matched
+            cells[keep], labels[keep], self.bank, self.min_cells, self.lambda_mean)
+        return ({"jepa": jepa, "alignment": align,
+                 "variance": variance_loss(cells[valid], self.gamma)},
+                {"align_lineages": float(n_matched), "emb_std": embedding_spread(cells[valid])})
 
     def state_dict(self) -> dict:
         """Serializable state (the embedding bank)."""

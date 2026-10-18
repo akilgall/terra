@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from terra.training.losses import (
     EmbeddingBank,
     TermSchedule,
+    embedding_spread,
     jepa_loss,
     pool_centre,
     pool_tokens,
@@ -84,6 +85,14 @@ def test_variance_loss_zero_for_spread_and_positive_for_collapse():
 
 def test_variance_loss_is_zero_for_single_row():
     assert variance_loss(torch.ones(1, 4)).item() == 0.0
+
+
+def test_embedding_spread_is_mean_per_dimension_std():
+    z = torch.tensor([[0.0, 1.0], [2.0, 1.0], [4.0, 1.0]], requires_grad=True)
+
+    assert embedding_spread(z) == pytest.approx(1.0)  # dim 0: std 2, dim 1: std 0
+    assert embedding_spread(torch.ones(5, 3)) == 0.0
+    assert embedding_spread(torch.ones(1, 3)) == 0.0
 
 
 def test_embedding_bank_fifo_per_lineage_ignores_unmapped():

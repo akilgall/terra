@@ -20,6 +20,7 @@ __all__ = [
     "pool_tokens",
     "view_consistency_loss",
     "variance_loss",
+    "embedding_spread",
     "EmbeddingBank",
     "routed_alignment_loss",
     "TermSchedule",
@@ -89,6 +90,17 @@ def variance_loss(z: torch.Tensor, gamma: float = 1.0, eps: float = 1e-4) -> tor
     return F.relu(gamma - std).mean()
 
 
+def embedding_spread(z: torch.Tensor) -> float:
+    """
+    Mean per-dimension std of a batch of embeddings (0 for fewer than two rows).
+
+    Collapse monitor: it falls towards 0 when every cell maps to the same point.
+    """
+    if z.size(0) < 2:
+        return 0.0
+    return z.detach().float().std(dim=0).mean().item()
+
+
 class EmbeddingBank:
     """
     Per-lineage FIFO of detached embeddings.
@@ -148,7 +160,9 @@ def routed_alignment_loss(z: torch.Tensor,
     CORAL + mean matching between `z` and the bank, per shared lineage.
 
     CORAL only matches covariances, so without the first-moment term the two
-    domains could stay translated copies of each other.
+    domains could stay translated copies of each other. On TERRA's
+    layer-normed cell embeddings (per-dimension std ~0.2) the CORAL part is
+    about 1e-4, so the mean term does most of the work.
 
     Returns
     -------

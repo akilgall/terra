@@ -26,12 +26,14 @@ and this project adheres to [Semantic Versioning][].
     `finetune_self_supervised` config trains on spatial cells with their
     neighbours, the same cells without neighbours, and dissociated cells
     (e.g. Tahoe-100M) in one run, with view-consistency and per-lineage
-    CORAL + mean alignment losses (`terra.training.stream_objective`). It can
+    mean + CORAL alignment losses on whole-cell embeddings
+    (`terra.training.stream_objective`). Each stream logs `emb_std`, the
+    spread of its cell embeddings, to catch representation collapse. It can
     switch to an asymmetric sequence layout (e.g. 2048 centre genes, 256 per
     neighbour), train the embeddings of genes unseen in pretraining, use
     gradient checkpointing and resume from a checkpoint. See
-    `configs/finetune/tahoe_alignment.yaml`. Configs without `data.streams`
-    run the existing loop unchanged.
+    `configs/finetune/tahoe_alignment.yaml` and `docs/tahoe_alignment.md`.
+    Configs without `data.streams` run the existing loop unchanged.
 -   `embed_dataset`, `gene_embed_dataset` and `infer_token_distance` load
     models whose config uses the asymmetric layout (`data.seq_len_neigh`,
     `meta.n_positions`), e.g. those exported after multi-stream fine-tuning.

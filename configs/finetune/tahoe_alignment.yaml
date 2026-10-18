@@ -36,22 +36,25 @@ data:
     # Steps per epoch are split between streams by weight (1/3 each here).
     spatial:                     # cells with their neighbours: JEPA
       kind: spatial_full
-      paths: [/path/to/spatial_labeled_ds]
+      paths: [/path/to/spatial_labeled/spatial_ds]
       weight: 1.0
     spatial_cell:                # same cells, neighbours hidden
       kind: spatial_cell_only
-      paths: [/path/to/spatial_labeled_ds]
+      paths: [/path/to/spatial_labeled/spatial_ds]
       weight: 1.0
     tahoe:                       # Tahoe-100M cells (no coordinates)
       kind: cell_only
-      paths: [/path/to/tahoe_dev/tahoe_ds]
+      paths: [/path/to/tahoe_slice/tahoe_ds]
       weight: 1.0
       batch_size: 64             # short trimmed rows -> larger batches fit
 
 finetune:
   device: auto                   # auto | cpu | mps | cuda:N
   num_epochs: 10
-  lr: 1.0e-03
+  # 1e-3 (the Xenium notebook value) collapsed the online encoder within 60
+  # steps in tests with this LoRA scale (alpha / rank = 16), with or without
+  # warmup; watch <stream>/emb_std in the logs.
+  lr: 1.0e-04
   start_lr: 1.0e-05
   final_lr: 1.0e-05
   warmup_epochs: 1
@@ -104,4 +107,5 @@ finetune:
       lambda_mean: 1.0           # mean matching alongside CORAL
     variance:                    # anti-collapse hinge on cell-only streams
       weight: 0.1
-      gamma: 1.0
+      gamma: 0.2                 # per-dim std floor, ~the pretrained spread;
+                                 # 1.0 inflates the Tahoe embeddings
