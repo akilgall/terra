@@ -89,6 +89,7 @@ from ..preprocessors.normalizers import normalize_by_read_depth
 from ..preprocessors.normalizers import normalize_by_seurat
 from ..preprocessors.normalizers import normalize_by_shifted_log
 from ..preprocessors.normalizers import normalize_by_pflog1ppf
+from .segment_format import format_asymmetric_example, resolve_segment_budgets
 from .tokenize import process_gene_expr, process_gene_tokens, rank_gene_tokens
 
 
@@ -534,6 +535,9 @@ class CellBaseTokenizer(ABC):
 
 class CellGraphTokenizer(CellBaseTokenizer):
     def __init__(self,
+                 seq_len_cell: int | None = None,
+                 seq_len_neigh: int | None = None,
+                 cell_only: bool = False,
                  **base_tokenizer_kwargs,
                  ):
         """
@@ -541,13 +545,38 @@ class CellGraphTokenizer(CellBaseTokenizer):
 
         Parameters
         -----------
+        seq_len_cell:
+            Centre-cell slots for the asymmetric layout. With
+            `seq_len_neigh`, `model_input_size` must equal
+            `seq_len_cell + n_neighs * seq_len_neigh`.
+        seq_len_neigh:
+            Fixed slots per neighbour for the asymmetric layout.
+        cell_only:
+            If `True`, skip the spatial graph (no `obsm['spatial']` needed)
+            and store only the centre segment (e.g. dissociated cells).
         **base_tokenizer_kwargs:
             Keyword arguments for the initialization of the
             CellBaseTokenizer.
+
+        Without `seq_len_cell`, `seq_len_neigh` and `cell_only` the legacy
+        layout is used (segments share `model_input_size` evenly).
         """
         super().__init__(**base_tokenizer_kwargs)
 
-        self.seq_len_cell = int(self.model_input_size / (self.n_neighs + 1))
+        self.cell_only = cell_only
+        self.asymmetric = (cell_only or seq_len_cell is not None
+                           or seq_len_neigh is not None)
+        if self.asymmetric:
+            self.seq_len_cell, self.seq_len_neigh = resolve_segment_budgets(
+                model_input_size=self.model_input_size,
+                n_neighs=self.n_neighs,
+                seq_len_cell=seq_len_cell,
+                seq_len_neigh=seq_len_neigh,
+                cell_only=cell_only)
+        else:
+            self.seq_len_cell = int(
+                self.model_input_size / (self.n_neighs + 1))
+            self.seq_len_neigh = self.seq_len_cell
 
     def _tokenize_adata(self,
                         adata_file_path: Path | str | None = None,
@@ -617,15 +646,22 @@ class CellGraphTokenizer(CellBaseTokenizer):
 
         adata_neigh = adata
 
-        logger.info('Computing spatial neighborhood...')
-        # Construct neighbor graph
-        adata_neigh = construct_neighbor_graph(
-            adata_neigh,
-            n_neighs=self.n_neighs,
-            radius=self.radius,
-            delaunay=self.delaunay,
-            include_self_loop=False,
-            compute_neighbor_counts=False)
+        if self.cell_only:
+            # No spatial context: an empty graph means no neighbour segments.
+            logger.info('Cell-only records: skipping the spatial neighborhood.')
+            empty_graph = sp.csr_matrix((adata.n_obs, adata.n_obs))
+            adata_neigh.obsp['spatial_connectivities'] = empty_graph
+            adata_neigh.obsp['spatial_distances'] = empty_graph.copy()
+        else:
+            logger.info('Computing spatial neighborhood...')
+            # Construct neighbor graph
+            adata_neigh = construct_neighbor_graph(
+                adata_neigh,
+                n_neighs=self.n_neighs,
+                radius=self.radius,
+                delaunay=self.delaunay,
+                include_self_loop=False,
+                compute_neighbor_counts=False)
 
         logger.info('Normalizing gene expression counts...')
         # Perform normalization of counts per cell for rank and count
@@ -823,10 +859,8 @@ class CellGraphTokenizer(CellBaseTokenizer):
         # relative coordinates are float position encodings and the dataset
         # fills padded positions with -inf, which cannot be cast to an int
         # tensor (e.g. when a platform stores integer pixel coordinates).
-        adata_dict['rel_x_coord'] = [
-            [0.0] for coord in adata.obsm['spatial'][:, 0].tolist()]
-        adata_dict['rel_y_coord'] = [
-            [0.0] for coord in adata.obsm['spatial'][:, 1].tolist()]
+        adata_dict['rel_x_coord'] = [[0.0] for _ in range(adata.n_obs)]
+        adata_dict['rel_y_coord'] = [[0.0] for _ in range(adata.n_obs)]
 
         # Prepare gene tokens for cell and neighborhood for this batch
         adata_dict['gene_tokens_cell'] = []
@@ -980,7 +1014,10 @@ class CellGraphTokenizer(CellBaseTokenizer):
         # Cast integer coordinates (e.g. 10x Visium pixel coordinates) to float
         # so the relative position encodings are float — the dataset fills
         # padded positions with -inf, which overflows an int tensor.
-        coords = np.asarray(adata.obsm['spatial'])
+        if self.cell_only and 'spatial' not in adata.obsm:
+            coords = np.zeros((adata.n_obs, 2), dtype=np.float32)
+        else:
+            coords = np.asarray(adata.obsm['spatial'])
         if not np.issubdtype(coords.dtype, np.floating):
             coords = coords.astype(np.float32)
         cell_id_list = (adata.obs['cell_id'].values.tolist()
@@ -1025,7 +1062,9 @@ class CellGraphTokenizer(CellBaseTokenizer):
             # instead of (n_neighbors x model_input_size).
             n_nonempty = sum(1 for k in ordered_neighbors
                              if len(gene_tokens_cell_neigh[k]) > 0)
-            seg_length = self.model_input_size // (1 + n_nonempty)
+            # Asymmetric layout: every neighbour has a fixed slot budget.
+            seg_length = (self.seq_len_neigh if self.asymmetric
+                          else self.model_input_size // (1 + n_nonempty))
             # Guard: if the per-segment length rounds to 0 (pathologically high
             # degree), store the full arrays so the stored segment set -- and
             # hence the n_gene_segments / cell-segment length that
@@ -1063,7 +1102,7 @@ class CellGraphTokenizer(CellBaseTokenizer):
             if self.add_neigh_cell_ids:
                 for k in ordered_neighbors:
                     adata_dict['cell_ids'][i].extend(
-                        [cell_id_list[k]] * self.seq_len_cell)
+                        [cell_id_list[k]] * self.seq_len_neigh)
 
         del adata_dict['gene_tokens_cell_neigh']
         del adata_dict['gene_expr_cell_neigh']
@@ -1119,6 +1158,16 @@ class CellGraphTokenizer(CellBaseTokenizer):
         """
         Format examples.
         """
+        if self.asymmetric:
+            return format_asymmetric_example(
+                example,
+                seq_len_cell=self.seq_len_cell,
+                seq_len_neigh=self.seq_len_neigh,
+                n_neighs=int(self.n_neighs),
+                cell_only=self.cell_only,
+                token_dict=self.token_dict,
+                include_special_tokens=self.include_special_tokens)
+
         # Get example-specific number of gene segments
         n_gene_segments = 1 # index cell segment
         if len(example['seg_tokens_neighborhood']) > 0:

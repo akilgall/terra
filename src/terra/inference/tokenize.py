@@ -42,6 +42,32 @@ from typing import Dict, List
 logger = logging.getLogger(__name__)
 
 
+def _cell_graph_layout_kwargs(data_config: dict,
+                              adata: ad.AnnData,
+                              cell_only: bool | None,
+                              ) -> dict:
+    """
+    Tokenizer layout kwargs for the cell-graph tokenizer.
+
+    Asymmetric budgets come from `data.seq_len_neigh` in the model config;
+    cell-only mode from the explicit argument, else `data.cell_only`, else
+    the absence of spatial coordinates. Returns `{}` for the legacy layout.
+    """
+    if cell_only is None:
+        cell_only = bool(data_config.get('cell_only', False)) or \
+            'spatial' not in adata.obsm
+        if cell_only and 'spatial' not in adata.obsm:
+            logger.info("No adata.obsm['spatial']: tokenizing cell-only records.")
+    kwargs = {}
+    if data_config.get('seq_len_neigh') is not None:
+        kwargs['seq_len_cell'] = data_config['seq_len_cell']
+        kwargs['seq_len_neigh'] = data_config['seq_len_neigh']
+    if cell_only:
+        kwargs['cell_only'] = True
+        kwargs.setdefault('seq_len_cell', data_config['seq_len_cell'])
+    return kwargs
+
+
 def tokenize_adata(adata: ad.AnnData,
                    model_folder_path: str,
                    cache_directory_path: str,             
@@ -52,6 +78,7 @@ def tokenize_adata(adata: ad.AnnData,
                    use_generator: bool = True,
                    keep_in_memory: bool = False,
                    include_special_tokens: bool = False,
+                   cell_only: bool | None = None,
                    ) -> Dataset:
     """
     Tokenize an AnnData object based on the parameters in the model config and
@@ -79,6 +106,11 @@ def tokenize_adata(adata: ad.AnnData,
         Whether to keep dataset in memory.
     include_special_tokens:
         Whether to include special tokens in the tokenized output.
+    cell_only:
+        Tokenize cells without spatial neighbours (e.g. dissociated
+        single-cell data). `None` uses `data.cell_only` from the model config,
+        or `True` when `adata.obsm` has no `'spatial'` coordinates. Only
+        supported for the `cell_graph` tokenizer.
 
     Returns
     -----------
@@ -120,10 +152,13 @@ def tokenize_adata(adata: ad.AnnData,
 
     logger.info('STEP 2: TOKENIZING ANNDATA OBJECT...')
     # Tokenize adata
+    layout_kwargs = {}
     if model_config['data']['tokenizer_type'] == 'cell_neigh':
         Tokenizer = cell_tokenizers.CellNeighborhoodTokenizer
     elif model_config['data']['tokenizer_type'] == 'cell_graph':
         Tokenizer = cell_tokenizers.CellGraphTokenizer
+        layout_kwargs = _cell_graph_layout_kwargs(
+            model_config['data'], adata, cell_only)
     tk = Tokenizer(
         nproc=nproc,
         processing_mode=processing_mode,
@@ -141,7 +176,8 @@ def tokenize_adata(adata: ad.AnnData,
         pf_targets_file_path=pf_targets_file_path,
         token_dictionary_file_path=token_dictionary_file_path,
         add_neigh_cell_ids=add_neigh_cell_ids,
-        include_special_tokens=include_special_tokens)
+        include_special_tokens=include_special_tokens,
+        **layout_kwargs)
     dataset_dict = tk._tokenize_adata(adata=adata)
     dataset = tk._create_dataset(
         dataset_dict=dataset_dict,
