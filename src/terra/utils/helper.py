@@ -17,7 +17,7 @@ import terra.models.gene_transformers as gt
 from terra.models.batch_classifier import BatchClassifierHead
 from terra.models.multimask import (EncoderMultiMaskWrapper,
                                         PredictorMultiMaskWrapper)
-from terra.models.utils import trunc_normal_
+from terra.models.utils import get_1d_sincos_pos_embed, trunc_normal_
 from terra.utils.schedulers import (CosineWDSchedule,
                                         WarmupCosineSchedule)
 
@@ -553,6 +553,9 @@ def init_model(gt_type: Literal['rank', 'count', 'combined'],
                adaln_kwargs: dict | None = None,
                rda_kwargs: dict | None = None,
                special_token_moe_kwargs: dict | None = None,
+               seq_len_cell: int | None = None,
+               n_positions: int | None = None,
+               grad_checkpointing: bool = False,
                ) -> tuple[gt.GeneTransformerBaseEncoder,
                           gt.GeneTransformerBasePredictor]:
     """
@@ -597,6 +600,16 @@ def init_model(gt_type: Literal['rank', 'count', 'combined'],
     predict_gene:
         If `True`, predict gene given rank, otherwise predict rank given
         gene.
+    seq_len_cell:
+        Centre-cell slots for the asymmetric layout. `None` derives it by
+        splitting the sequence evenly over `n_segments` (pretrained layout).
+    n_positions:
+        Rows (minus padding) of the frozen sincos position tables. `None`
+        uses `seq_len`. Fine-tuning passes the pretrained `seq_len` so the
+        pretrained tables load unchanged.
+    grad_checkpointing:
+        If `True`, recompute block activations in the backward pass to save
+        memory (training only).
 
     Returns
     -----------
@@ -691,7 +704,10 @@ def init_model(gt_type: Literal['rank', 'count', 'combined'],
                          else math.pi),
         rope_rotation_augment=rope_rotation_augment,
         adaln_kwargs=adaln_kwargs_enc,
-        rda_kwargs=rda_kwargs)
+        rda_kwargs=rda_kwargs,
+        seq_len_cell=seq_len_cell,
+        n_positions=n_positions,
+        grad_checkpointing=grad_checkpointing)
     if api_version == 'v3' or api_version == 'v4':
         encoder = EncoderMultiMaskWrapper(encoder)
     predictor = gt.__dict__["init_gt_predictor"](
@@ -717,7 +733,9 @@ def init_model(gt_type: Literal['rank', 'count', 'combined'],
                          else math.pi),
         rope_rotation_augment=rope_rotation_augment,
         adaln_kwargs=adaln_kwargs_pred,
-        special_token_moe_kwargs=special_token_moe_kwargs)
+        special_token_moe_kwargs=special_token_moe_kwargs,
+        n_positions=n_positions,
+        grad_checkpointing=grad_checkpointing)
     if api_version == 'v3' or api_version == 'v4':
         predictor = PredictorMultiMaskWrapper(predictor)
 
@@ -763,6 +781,127 @@ def init_model(gt_type: Literal['rank', 'count', 'combined'],
         f'Predictor number of parameters: {count_parameters(predictor)}')
 
     return encoder, predictor
+
+
+def _apply_param_group_overrides(
+        param_groups: list[dict],
+        named_params: list[tuple[str, nn.Parameter]],
+        overrides: list[dict],
+        ) -> list[dict]:
+    """
+    Move parameters matching each override into a dedicated group.
+
+    Returns new group dicts; the input groups are not modified.
+    """
+    claimed: set[int] = set()
+    extra_groups = []
+    for override in overrides:
+        match = override['match']
+        params = [p for name, p in named_params
+                  if match in name and id(p) not in claimed]
+        if not params:
+            raise ValueError(
+                f"param_group_overrides: no parameter name contains {match!r}.")
+        claimed.update(id(p) for p in params)
+        weight_decay = float(override.get('weight_decay', 0.0))
+        extra_groups.append({
+            'params': params,
+            'lr_scale': float(override.get('lr_mult', 1.0)),
+            'weight_decay': weight_decay,
+            'WD_exclude': weight_decay == 0.0,
+        })
+    base_groups = [
+        {**group, 'params': [p for p in group['params']
+                             if id(p) not in claimed]}
+        for group in param_groups]
+    return base_groups + extra_groups
+
+
+def _sincos_table(n_positions: int, embed_dim: int) -> torch.Tensor:
+    """Frozen position table: zero padding row + sincos rows 1..n_positions."""
+    rows = torch.from_numpy(get_1d_sincos_pos_embed(
+        embed_dim=embed_dim, n_zero_pos=0, n_sincos_pos=n_positions)).float()
+    return torch.cat([torch.zeros(1, embed_dim), rows])
+
+
+def extend_pos_embed_state_dict(state_dict: dict[str, torch.Tensor],
+                                n_positions: int,
+                                atol: float = 1e-3,
+                                ) -> dict[str, torch.Tensor]:
+    """
+    Grow frozen sincos position tables to `n_positions` (+1 padding row).
+
+    Only needed when the centre-cell budget exceeds the pretrained table.
+    Existing rows are kept; the new rows are the sincos continuation.
+
+    Parameters
+    ----------
+    state_dict:
+        Model state dict (not modified).
+    n_positions:
+        Required number of positions.
+    atol:
+        Tolerance when checking that existing rows are the sincos table
+        (absorbs small EMA drift).
+
+    Raises
+    ----------
+    ValueError
+        If a table that must grow is not the frozen sincos table (e.g. it
+        was learned), since extending it would mix incompatible encodings.
+    """
+    extended = dict(state_dict)
+    for key, table in state_dict.items():
+        if not key.endswith('pos_embed.weight') or \
+                table.shape[0] >= n_positions + 1:
+            continue
+        fresh = _sincos_table(n_positions, table.shape[1]).to(
+            device=table.device, dtype=table.dtype)
+        n_old = table.shape[0]
+        deviation = (table - fresh[:n_old]).abs().max().item()
+        if deviation > atol:
+            raise ValueError(
+                f"{key}: existing rows deviate from the frozen sincos table "
+                f"by {deviation:.3g} (> {atol}); refusing to extend a "
+                "learned position table.")
+        extended[key] = torch.cat([table, fresh[n_old:]])
+    return extended
+
+
+def register_row_grad_mask(embedding: nn.Embedding,
+                           trainable_rows: torch.Tensor,
+                           ) -> torch.utils.hooks.RemovableHandle:
+    """
+    Zero the gradient of every embedding row except `trainable_rows`.
+
+    Used to train only the gene tokens never seen in pretraining while the
+    pretrained rows stay fixed. Returns the hook handle (`.remove()` undoes
+    it).
+    """
+    mask = torch.zeros(embedding.num_embeddings, 1)
+    mask[trainable_rows] = 1.0
+
+    def _mask_grad(grad: torch.Tensor) -> torch.Tensor:
+        return grad * mask.to(device=grad.device, dtype=grad.dtype)
+
+    return embedding.weight.register_hook(_mask_grad)
+
+
+def unseen_gene_rows(token_dict: dict, gene_count_dict: dict) -> torch.Tensor:
+    """
+    Token ids of Ensembl genes absent from the pretraining gene counts.
+
+    Parameters
+    ----------
+    token_dict:
+        Model token dictionary (gene / special token -> id).
+    gene_count_dict:
+        Pretraining gene occurrence counts (`gene_count_dictionary.pkl`).
+    """
+    rows = sorted(idx for gene, idx in token_dict.items()
+                  if str(gene).startswith('ENSG')
+                  and gene not in gene_count_dict)
+    return torch.tensor(rows, dtype=torch.long)
 
 
 def build_batch_classifier_head(
@@ -835,6 +974,7 @@ def init_opt(encoder: gt.GeneTransformerBaseEncoder,
              use_bfloat16: bool = False,
              ipe_scale: float = 1.25,
              api_version: Literal['v1', 'v2', 'v3', 'v4'] = 'v4',
+             param_group_overrides: list[dict] | None = None,
              ) -> tuple[torch.optim.AdamW,
                         torch.cuda.amp.GradScaler,
                         WarmupCosineSchedule,
@@ -858,13 +998,19 @@ def init_opt(encoder: gt.GeneTransformerBaseEncoder,
     use_bfloat16:
     ipe_scale:
     api_version:
+    param_group_overrides:
+        Optional list of `{'match', 'lr_mult', 'weight_decay'}` dicts. Every
+        parameter whose name contains `match` moves into its own group with
+        learning rate `lr_mult` x the scheduled rate. `weight_decay=0`
+        excludes the group from weight decay; a non-zero value follows the
+        weight-decay schedule. `None` keeps the default four groups.
 
     Returns
     -----------
     optimizer:
     scaler:
     scheduler:
-    wd_scheduler:    
+    wd_scheduler:
     """
     # A param goes into the no-weight-decay group if it's a bias, a 1-D
     # weight (LayerNorm scale, etc.), OR has been explicitly flagged
@@ -890,6 +1036,12 @@ def init_opt(encoder: gt.GeneTransformerBaseEncoder,
                                 if _no_wd(n, p)],
                      'WD_exclude': True,
                      'weight_decay': 0}]
+    if param_group_overrides:
+        param_groups = _apply_param_group_overrides(
+            param_groups,
+            list(encoder.named_parameters()) +
+            list(predictor.named_parameters()),
+            param_group_overrides)
 
     # Initialize optimizer with decoupled weight decay
     logger.info('Initializing optimizer: AdamW.')
