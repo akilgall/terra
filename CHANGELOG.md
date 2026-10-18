@@ -22,6 +22,16 @@ and this project adheres to [Semantic Versioning][].
     as it does on CUDA. CPU runs stay in float32, as before. On MPS, attention
     is computed in batch chunks when the attention-score matrix would exceed
     MPS's 32-bit indexing limit (e.g. fine-tuning TERRA-96M at batch size 100).
+-   **Multi-stream alignment fine-tuning**: setting `data.streams` in the
+    `finetune_self_supervised` config trains on spatial cells with their
+    neighbours, the same cells without neighbours, and dissociated cells
+    (e.g. Tahoe-100M) in one run, with view-consistency and per-lineage
+    CORAL + mean alignment losses (`terra.training.stream_objective`). It can
+    switch to an asymmetric sequence layout (e.g. 2048 centre genes, 256 per
+    neighbour), train the embeddings of genes unseen in pretraining, use
+    gradient checkpointing and resume from a checkpoint. See
+    `configs/finetune/tahoe_alignment.yaml`. Configs without `data.streams`
+    run the existing loop unchanged.
 
 ### Changed
 
@@ -44,6 +54,11 @@ and this project adheres to [Semantic Versioning][].
 -   The `laplacian` cell positional encoding falls back to CPU for the
     eigendecomposition on backends without `torch.linalg.eigh` (MPS before
     PyTorch 2.10).
+-   `prepare_finetuned_model(..., use_peft=True)` now applies the LoRA scale
+    (`peft_alpha / peft_rank`, read from the run's `params.yaml`) when merging
+    the adapters. The exported `encoder` and `predictor` previously omitted
+    it (e.g. a 16x too small update with the tutorial's rank 16, alpha 256).
+    The `target_encoder`, which embedding uses, was not affected.
 
 ## [0.1.13] - 2026-07-28
 
