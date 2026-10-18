@@ -1,0 +1,17 @@
+# Shared lineages for aligning Tahoe-100M cell lines with spatial cells.
+#
+# Alignment (CORAL + mean matching) only pairs cells that map to the same
+# lineage; everything unmapped (e.g. immune and stromal spatial cells, Tahoe
+# lines from other organs) is still trained with the JEPA objective but never
+# pulled towards the other domain.
+#
+# tahoe_organs:        values of Tahoe cell_line_metadata 'Organ'
+#                      (Lung, Bowel, Pancreas, Skin, CNS/Brain, ...).
+# spatial_cell_types:  values of the spatial AnnData's cell-type column; add
+#                      the tumour-cell labels used in your own annotation.
+lineages:
+  lung:
+    tahoe_organs:
+      - Lung
+    spatial_cell_types:
+      - tumor
