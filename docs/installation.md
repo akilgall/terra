@@ -1,21 +1,34 @@
 # Installation
 
-TERRA is published on PyPI as `terra-st` (the import name is `terra`) and
-**requires an NVIDIA GPU**. Install in two steps — PyTorch first, so it matches
-your GPU, then TERRA. We recommend [uv](https://docs.astral.sh/uv/).
+TERRA is published on PyPI as `terra-st` (the import name is `terra`). It runs on
+NVIDIA GPUs (CUDA), Apple Silicon GPUs (MPS) and CPU. An NVIDIA GPU is
+recommended for pretraining and large-scale embedding. Fine-tuning, count
+decoding and inference also run on a Mac. Install in two steps — PyTorch first,
+so it matches your hardware, then TERRA. We recommend
+[uv](https://docs.astral.sh/uv/).
 
 ## 1. Install PyTorch for your hardware
 
-Install the [PyTorch](https://pytorch.org) build that matches your GPU driver
-**before** installing TERRA, so the correct CUDA wheel is used (otherwise a plain
-install pulls the default wheel, which may not match your driver). Run
-`nvidia-smi` and read the "CUDA Version" in the top-right, then install the
-matching CUDA build — see the
+**NVIDIA GPU (Linux / Windows).** Install the [PyTorch](https://pytorch.org)
+build that matches your GPU driver **before** installing TERRA, so the correct
+CUDA wheel is used (otherwise a plain install pulls the default wheel, which may
+not match your driver). Run `nvidia-smi` and read the "CUDA Version" in the
+top-right, then install the matching CUDA build — see the
 [official PyTorch install guide](https://pytorch.org/get-started/locally/) — e.g.:
 
 ```shell
 uv pip install torch --index-url https://download.pytorch.org/whl/cu124
 ```
+
+**Apple Silicon (macOS).** The default PyTorch wheel includes MPS support:
+
+```shell
+uv pip install torch
+```
+
+**CPU only.** On Linux, install the CPU wheel
+(`uv pip install torch --index-url https://download.pytorch.org/whl/cpu`); on
+macOS and Windows the default wheel works.
 
 ## 2. Install TERRA
 
@@ -24,17 +37,50 @@ uv pip install terra-st
 ```
 
 Plain `pip install terra-st` works too. Verify the install (PyTorch sees your
-GPU, and TERRA imports):
+accelerator, and TERRA imports):
 
 ```shell
-python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.backends.mps.is_available())"
 python -c "import terra; print(terra.__version__)"
 ```
 
-The last value printed by the first command should be `True` — TERRA requires a
-GPU, so `torch.cuda.is_available()` must report one. If it prints `False`,
+On an NVIDIA machine the first boolean should be `True`; if it prints `False`,
 PyTorch can't see your GPU (usually a CUDA build that doesn't match your driver
-— revisit step 1).
+— revisit step 1). On Apple Silicon the second boolean should be `True`. If
+both are `False`, TERRA runs on the CPU, which is fine for small datasets but
+slow for large ones.
+
+## Choosing a device
+
+TERRA picks the device automatically, preferring CUDA, then MPS, then CPU. To
+override it:
+
+- **Embedding:** pass `device=` to `harmonize_tokenize_embed_pipeline`,
+  `embed_dataset` or `gene_embed_dataset`, e.g. `device="cpu"` or `device="mps"`.
+- **Fine-tuning:** set `device` in the `finetune` section of the config used by
+  `terra.training.finetune` / `terra.training.finetune_self_supervised`:
+
+  ```yaml
+  finetune:
+    device: mps   # auto (default), cpu, mps, cuda or cuda:N
+  ```
+
+- **Count decoder:** `python -m terra.training.decode ... --device mps`, or
+  `apply_count_decoder(..., device="mps")`. Legacy GPU ids still work
+  (`--device -1` selects the CPU).
+
+Notes for Apple Silicon:
+
+- `use_bfloat16` enables bfloat16 mixed precision on MPS, as on CUDA. On the CPU
+  TERRA always runs in float32.
+- macOS starts `DataLoader` workers with `spawn`, so each worker re-imports
+  TERRA's dependencies. The shipped configs use `num_workers: 16`; on a Mac,
+  0–4 workers is usually faster.
+- If PyTorch lacks an MPS kernel for an operation it raises
+  `NotImplementedError`. Setting `PYTORCH_ENABLE_MPS_FALLBACK=1` runs such
+  operations on the CPU instead.
+- Pretraining (`terra.training.main`) still requires NVIDIA GPUs (it uses DDP
+  with NCCL).
 
 ## Development install
 

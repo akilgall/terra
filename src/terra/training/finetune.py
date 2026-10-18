@@ -49,11 +49,12 @@ from torch.nn.parallel import DistributedDataParallel
 from datasets import Dataset, load_from_disk
 
 from terra.utils.helper import (init_model, load_checkpoint, apply_peft,
-                                parse_protein_init_kwargs)
+                                parse_arch_kwargs, parse_protein_init_kwargs)
 from terra.datasets.cell_datasets import init_cell_dataset
 from terra.datasets.dataloaders import init_dataloader_and_sampler
 from terra.masks.block_masking  import BlockMaskCollator
 from terra.masks.cell_masking import CellMaskCollator
+from terra.utils.device import get_device, should_pin_memory
 from terra.utils.distributed import init_distributed
 from terra.models.modules import ClassificationModel
 from terra.utils.embedding import create_binary_selection_mask
@@ -334,7 +335,8 @@ def finetune(
     ----------
     args:
         Config dict. Relevant sub-dicts: args['model'], args['data'],
-        args['finetune'].
+        args['finetune']. The optional args['finetune']['device'] selects
+        'auto' (default: CUDA > MPS > CPU), 'cpu', 'mps' or 'cuda:N'.
     train_adata:
         AnnData with obs columns 'cell_id' and the integer label column.
     train_dataset:
@@ -395,12 +397,8 @@ def finetune(
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
 
-    # Set device
-    if not torch.cuda.is_available():
-        device = torch.device('cpu')
-    else:
-        device = torch.device('cuda:0')
-        torch.cuda.set_device(device)
+    # Set device (CUDA > MPS > CPU unless finetune.device is set)
+    device = get_device(args['finetune'].get('device'))
 
     # -------------------------------------------------------------------- #
     # LOAD MODEL CONFIG
@@ -479,7 +477,7 @@ def finetune(
         world_size=1,
         rank=0,
         collate_fn=mask_collator,
-        pin_memory=args['data']['pin_memory'],
+        pin_memory=should_pin_memory(device, args['data']['pin_memory']),
         num_workers=args['data']['num_workers'],
         drop_last=False,
         persistent_workers=False,
@@ -517,7 +515,7 @@ def finetune(
             world_size=1,
             rank=0,
             collate_fn=mask_collator,
-            pin_memory=args['data']['pin_memory'],
+            pin_memory=should_pin_memory(device, args['data']['pin_memory']),
             num_workers=args['data']['num_workers'],
             drop_last=False,
             persistent_workers=False,
@@ -556,7 +554,7 @@ def finetune(
         world_size=1,
         rank=0,
         collate_fn=mask_collator,
-        pin_memory=args['data']['pin_memory'],
+        pin_memory=should_pin_memory(device, args['data']['pin_memory']),
         num_workers=args['data']['num_workers'],
         drop_last=False,
         persistent_workers=False,
@@ -623,7 +621,10 @@ def finetune(
         sep_gene_tokens_neb=model_config['data']['sep_gene_tokens_neb'],
         predict_gene=model_config['meta']['predict_gene'],
         pos_learnable=model_config['meta']['pos_learnable'],
-        protein_init_kwargs=protein_init_kwargs
+        nz_spc=model_config['data'].get('nz_spc', False),
+        mlp_bias=model_config['meta'].get('mlp_bias', True),
+        protein_init_kwargs=protein_init_kwargs,
+        **parse_arch_kwargs(model_config)
     )
 
     _, _, target_encoder, _, _, _, _ = load_checkpoint(

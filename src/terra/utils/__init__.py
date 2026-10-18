@@ -1,4 +1,5 @@
 from .config import *
+from .device import *
 from .distributed import *
 from .embedding import *
 from .evaluation import *

@@ -40,6 +40,21 @@ logger = logging.getLogger(__name__)
 DEBUG = False
 
 
+def _eigh(matrix: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    ``torch.linalg.eigh`` with a CPU fallback for backends that lack it
+    (e.g. MPS before torch 2.10). The Laplacian matrices decomposed here are
+    small (n_cells x n_cells), so the round trip is cheap.
+    """
+    try:
+        return torch.linalg.eigh(matrix)
+    except NotImplementedError:
+        if matrix.device.type == "cpu":
+            raise
+        eigvals, eigvecs = torch.linalg.eigh(matrix.cpu())
+        return eigvals.to(matrix.device), eigvecs.to(matrix.device)
+
+
 class GeneTransformerBaseEncoder(ABC, nn.Module):
     """
     GeneTransformerBaseEncoder class to encode contexts or targets.
@@ -798,7 +813,7 @@ class GeneTransformerBaseEncoder(ABC, nn.Module):
         with torch.no_grad():
             # eigh returns ascending eigenvalues. Skip the smallest
             # (trivial zero/near-zero eigenvalue) and take the next k.
-            _, eigvecs = torch.linalg.eigh(lap)              # (B, c, c)
+            _, eigvecs = _eigh(lap)                          # (B, c, c)
             pe = eigvecs[:, :, 1: self.laplacian_k + 1].contiguous()
             # Resolve sign ambiguity by convention: first non-missing
             # entry of each eigenvector is forced positive. (Eigvecs
@@ -917,7 +932,7 @@ class GeneTransformerBaseEncoder(ABC, nn.Module):
                     * deg_inv_sqrt.unsqueeze(-1)
                     * deg_inv_sqrt.unsqueeze(-2))
         lap = (eye.to(adj.dtype) - norm_adj)
-        eigvals, _ = torch.linalg.eigh(lap)  # (B, c) ascending
+        eigvals, _ = _eigh(lap)  # (B, c) ascending
         # Skip the smallest (~0) eigenvalue; use means across the batch.
         nontrivial = eigvals[:, 1:]
         eig_min = nontrivial[:, 0].mean()

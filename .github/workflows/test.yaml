@@ -31,6 +31,11 @@ jobs:
             python: "3.12"
             pip-flags: "--pre"
             name: PRE-RELEASE DEPENDENCIES
+          # Apple Silicon runner: covers the macOS install and CPU path. GitHub's
+          # virtualized macOS runners don't expose MPS, so MPS tests skip there.
+          - os: macos-latest
+            python: "3.12"
+            name: macOS
 
     name: ${{ matrix.name }} Python ${{ matrix.python }}
 

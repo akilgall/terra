@@ -1,7 +1,8 @@
 # Tutorials
 
 End-to-end notebooks for applying a pretrained TERRA model to your own spatial
-data. Running them requires an NVIDIA GPU.
+data. They run on an NVIDIA GPU (CUDA), an Apple Silicon GPU (MPS) or, more
+slowly, the CPU — see "Choosing a device" in the installation guide.
 
 ::::{grid} 1 2 2 3
 :gutter: 2

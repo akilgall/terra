@@ -11,6 +11,8 @@ from collections import Counter
 from torch import nn
 from sklearn.metrics import classification_report
 
+from terra.utils.device import get_device
+
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +47,7 @@ def knn_classifier(
         The path to save the results. If None, the results are not saved.
     """
     # --- Device setup ---
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
+    device = get_device()
 
     features_train = torch.tensor(features_train, dtype=torch.float32, device=device)
     labels_train = torch.tensor(labels_train, dtype=torch.long, device=device)
@@ -78,8 +79,10 @@ def knn_classifier(
 
         neighbor_labels = torch.cat(all_neighbor_labels, dim=0)
 
-    # Perform majority vote
-    predictions = torch.empty(num_test, dtype=labels_train.dtype, device=device)
+    # Perform majority vote on CPU (per-row indexing of an accelerator
+    # tensor would force a device sync for every test cell)
+    neighbor_labels = neighbor_labels.cpu()
+    predictions = torch.empty(num_test, dtype=labels_train.dtype)
     for i in range(num_test):
         # Count votes
         votes = Counter(neighbor_labels[i].tolist())

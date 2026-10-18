@@ -36,6 +36,7 @@ from terra.datasets.cell_datasets import init_cell_dataset
 from terra.datasets.dataloaders import init_dataloader_and_sampler
 from terra.masks.block_masking import BlockMaskCollator
 from terra.masks.utils import apply_masks
+from terra.utils.device import autocast, get_device, should_pin_memory
 from terra.utils.helper import init_model, init_opt
 
 logger = logging.getLogger(__name__)
@@ -120,7 +121,9 @@ def finetune_self_supervised(
         sections (see ``configs`` / the tutorial's ``config_Visium_IJEPA.yaml``
         for the schema). ``args['model']['pretrained_checkpoint_path']`` must
         point at a model folder containing ``model_config.yaml``,
-        ``token_dictionary.pkl`` and ``model_checkpoint.pt``.
+        ``token_dictionary.pkl`` and ``model_checkpoint.pt``. The optional
+        ``args['finetune']['device']`` selects ``'auto'`` (default: CUDA >
+        MPS > CPU), ``'cpu'``, ``'mps'`` or ``'cuda:N'``.
     dataset:
         Tokenised HuggingFace :class:`~datasets.Dataset` to fine-tune on. If
         ``None``, the tokenised sections listed in
@@ -165,13 +168,7 @@ def finetune_self_supervised(
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
 
-    if not torch.cuda.is_available():
-        device = torch.device('cpu')
-    elif LOCAL_RANK is not None:
-        device = torch.device(f"cuda:{LOCAL_RANK}")
-    else:
-        device = torch.device('cuda:0')
-        torch.cuda.set_device(device)
+    device = get_device(args['finetune'].get('device'), LOCAL_RANK)
 
     # -- Load the tokenised dataset if not provided ---------------------------
     if dataset is None:
@@ -231,7 +228,7 @@ def finetune_self_supervised(
         world_size=1,
         rank=0,
         collate_fn=mask_collator,
-        pin_memory=args['data']['pin_memory'],
+        pin_memory=should_pin_memory(device, args['data']['pin_memory']),
         num_workers=args['data']['num_workers'],
         drop_last=args['data'].get('drop_last', True),
         persistent_workers=False,
@@ -443,7 +440,7 @@ def finetune_self_supervised(
             _new_lr = lr_schedule.step()
             _new_wd = wd_schedule.step()
 
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_bfloat16):
+            with autocast(device, use_bfloat16):
                 # Target encoder forward pass
                 with torch.no_grad():
                     h, _ = target_encoder(batch=udata, masks_attention=masks_attention)

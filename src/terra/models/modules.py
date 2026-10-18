@@ -20,6 +20,43 @@ from terra.utils.embedding import compute_mean_unmasked_emb
 
 logger = logging.getLogger(__name__)
 
+# Largest attention-score matrix (B * H * L * S elements) a backend can
+# materialize. MPS kernels index with 32-bit integers, and its SDPA
+# materializes the scores whenever gradients are needed.
+_MAX_ATTN_SCORES = {"mps": 2**31 - 1}
+
+
+def _sdpa(q: torch.Tensor,
+          k: torch.Tensor,
+          v: torch.Tensor,
+          attn_mask: torch.Tensor | None,
+          scale: float) -> torch.Tensor:
+    """
+    ``scaled_dot_product_attention``, split along the batch dimension when
+    the attention scores would exceed the backend's limit (see
+    ``_MAX_ATTN_SCORES``). Results are identical to a single call.
+    """
+    batch_size, num_heads, q_len = q.shape[:3]
+    k_len = k.size(-2)
+    scores_per_sample = num_heads * q_len * k_len
+    limit = _MAX_ATTN_SCORES.get(q.device.type)
+    if limit is None or batch_size * scores_per_sample <= limit:
+        return F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, scale=scale)
+
+    chunk_size = max(1, limit // scores_per_sample)
+    # Only 4D masks carry a batch dimension; others broadcast over it.
+    has_batch_mask = (attn_mask is not None and attn_mask.dim() == 4
+                      and attn_mask.size(0) == batch_size)
+    outputs = []
+    for start in range(0, batch_size, chunk_size):
+        end = start + chunk_size
+        mask = attn_mask[start:end] if has_batch_mask else attn_mask
+        outputs.append(F.scaled_dot_product_attention(
+            q[start:end], k[start:end], v[start:end],
+            attn_mask=mask, scale=scale))
+    return torch.cat(outputs)
+
 
 class Attention(nn.Module):
     """
@@ -141,19 +178,9 @@ class Attention(nn.Module):
 
             if sdpa_kernel is not None:
                 with sdpa_kernel(_sdpa_backends):
-                    if masks is not None:
-                        x = nn.functional.scaled_dot_product_attention(
-                            q, k, v, attn_mask=masks, scale=self.scale)
-                    else:
-                        x = nn.functional.scaled_dot_product_attention(
-                            q, k, v, scale=self.scale)
+                    x = _sdpa(q, k, v, masks, self.scale)
             else:
-                if masks is not None:
-                    x = nn.functional.scaled_dot_product_attention(
-                        q, k, v, attn_mask=masks, scale=self.scale)
-                else:
-                    x = nn.functional.scaled_dot_product_attention(
-                        q, k, v, scale=self.scale)
+                x = _sdpa(q, k, v, masks, self.scale)
             attn = None
         else:
             attn = (q @ k.transpose(-2, -1)) * self.scale

@@ -36,17 +36,20 @@ task-specific retraining.
 
 ## Installation
 
-TERRA is published on PyPI as `terra-st` (the import name is `terra`) and
-**requires an NVIDIA GPU**. Install PyTorch first (so it matches your GPU), then
-TERRA — we recommend [uv](https://docs.astral.sh/uv/).
+TERRA is published on PyPI as `terra-st` (the import name is `terra`). It runs on
+NVIDIA GPUs (CUDA), Apple Silicon GPUs (MPS) and CPU. An NVIDIA GPU is
+recommended for pretraining and large-scale embedding. Fine-tuning, count
+decoding and inference also run on a Mac. Install PyTorch first (so it matches
+your hardware), then TERRA — we recommend [uv](https://docs.astral.sh/uv/).
 
-**1. Install PyTorch for your hardware.** Run `nvidia-smi`, read the "CUDA
-Version" in the top-right, and install the matching CUDA build (see the
-[PyTorch install guide](https://pytorch.org/get-started/locally/)), e.g.:
+**1. Install PyTorch for your hardware.**
 
-```shell
-uv pip install torch --index-url https://download.pytorch.org/whl/cu124
-```
+- **NVIDIA GPU:** run `nvidia-smi`, read the "CUDA Version" in the top-right,
+  and install the matching CUDA build (see the
+  [PyTorch install guide](https://pytorch.org/get-started/locally/)), e.g.
+  `uv pip install torch --index-url https://download.pytorch.org/whl/cu124`.
+- **Apple Silicon (macOS):** `uv pip install torch` (the default wheel includes
+  MPS support).
 
 **2. Install TERRA.**
 
@@ -57,16 +60,18 @@ uv pip install terra-st
 Plain `pip install terra-st` works too. For a development install from a clone
 of this repository (after step 1): `uv pip install -e ".[dev,test,doc]"`.
 
-Verify the install (PyTorch sees your GPU, and TERRA imports):
+Verify the install (PyTorch sees your accelerator, and TERRA imports):
 
 ```shell
-python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.backends.mps.is_available())"
 python -c "import terra; print(terra.__version__)"
 ```
 
-The last value from the first command should be `True` — TERRA requires a GPU.
-If it prints `False`, PyTorch can't see your GPU (usually a CUDA build that
-doesn't match your driver — revisit step 1).
+On an NVIDIA machine the first boolean should be `True` (if not, the CUDA build
+doesn't match your driver — revisit step 1). On Apple Silicon the second should
+be `True`. TERRA picks CUDA, then MPS, then CPU automatically; see the
+[installation guide](https://terra-st.readthedocs.io/en/latest/installation.html)
+for how to choose a device explicitly and for macOS tips.
 
 ## Quickstart
 

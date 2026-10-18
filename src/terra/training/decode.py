@@ -20,6 +20,7 @@ import argparse
 import json
 import logging
 import math
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -37,6 +38,8 @@ except ImportError:  # pragma: no cover - optional dependency
 import anndata as ad
 from scipy.stats import pearsonr
 from collections import OrderedDict
+
+from terra.utils.device import get_device, should_pin_memory
 
 
 logger = logging.getLogger(__name__)
@@ -615,7 +618,7 @@ def apply_count_decoder(
     checkpoint_path: Optional[str] = None,
     embed_fallback_key: Optional[str] = "neighborhood_emb",
     loss_type: Optional[str] = None,
-    device: int = 0,
+    device: int | str | None = None,
     batch_size: int = 1024,
 ) -> ad.AnnData:
     """
@@ -638,8 +641,10 @@ def apply_count_decoder(
         Fallback obsm key if emb_key is missing.
     loss_type : Optional[str]
         Override loss type ("nb_libsize", "nb_softplus"). Defaults to checkpoint.
-    device : int
-        GPU id (use -1 for CPU preference).
+    device : int | str | None
+        ``None``/``"auto"`` (CUDA > MPS > CPU), a device string such as
+        ``"cpu"``, ``"mps"`` or ``"cuda:0"``, or a legacy GPU id (``-1`` for
+        CPU).
     batch_size : int
         Batch size for inference.
 
@@ -693,7 +698,7 @@ def apply_count_decoder(
     )
     decoder.load_state_dict(state_dict, strict=True)
 
-    device_obj = get_device(device)
+    device_obj = _resolve_device(device)
     decoder = decoder.to(device_obj)
     decoder.eval()
 
@@ -1378,18 +1383,28 @@ def build_slide_indices(slide_names: np.ndarray) -> list[list[int]]:
 # DEVICE SELECTION
 # =============================================================================
 
-def get_device(device_id: int) -> torch.device:
+def _resolve_device(device: int | str | None) -> torch.device:
     """
-    Get the appropriate torch device based on device_id.
-    
+    Resolve the decoder's device, accepting legacy integer GPU ids.
+
     Parameters
     ----------
-    device_id : int
-        GPU id (use -1 for CPU preference).
+    device : int | str | None
+        ``None``/``"auto"`` picks CUDA > MPS > CPU. Device strings
+        (``"cpu"``, ``"mps"``, ``"cuda"``, ``"cuda:N"``) are used as given.
+        Legacy integers (also as strings, e.g. from the CLI): ``-1`` means
+        CPU, ``N >= 0`` means ``cuda:N`` when CUDA is available and auto
+        selection otherwise.
     """
-    if torch.cuda.is_available() and device_id >= 0:
-        return torch.device(f"cuda:{device_id}")
-    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if isinstance(device, str) and re.fullmatch(r"-?\d+", device):
+        device = int(device)
+    if isinstance(device, int):
+        if device < 0:
+            return get_device("cpu")
+        if torch.cuda.is_available():
+            return get_device(f"cuda:{device}")
+        return get_device("auto")
+    return get_device(device)
 
 
 # =============================================================================
@@ -1484,7 +1499,8 @@ def train(args: argparse.Namespace) -> dict:
         Dictionary with checkpoint path and best metrics.
     """
     set_seed(args.seed)
-    device = get_device(args.device)
+    device = _resolve_device(args.device)
+    pin_memory = should_pin_memory(device, True)
 
     logger.info(f"Using loss type: {args.loss_type}")
 
@@ -1675,7 +1691,7 @@ def train(args: argparse.Namespace) -> dict:
         loader_kwargs = {
             "batch_size": args.batch_size,
             "num_workers": args.num_workers,
-            "pin_memory": True,
+            "pin_memory": pin_memory,
         }
         train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
         train_eval_loader = DataLoader(train_dataset, shuffle=False, **loader_kwargs)
@@ -1691,25 +1707,25 @@ def train(args: argparse.Namespace) -> dict:
             train_dataset,
             batch_sampler=SlideBatchSampler(train_slide_indices, shuffle=True),
             num_workers=args.num_workers,
-            pin_memory=True,
+            pin_memory=pin_memory,
         )
         train_eval_loader = DataLoader(
             train_dataset,
             batch_sampler=SlideBatchSampler(train_slide_indices, shuffle=False),
             num_workers=args.num_workers,
-            pin_memory=True,
+            pin_memory=pin_memory,
         )
         val_eval_loader = DataLoader(
             val_dataset,
             batch_sampler=SlideBatchSampler(val_slide_indices, shuffle=False),
             num_workers=args.num_workers,
-            pin_memory=True,
+            pin_memory=pin_memory,
         )
         test_eval_loader = DataLoader(
             test_dataset,
             batch_sampler=SlideBatchSampler(test_slide_indices, shuffle=False),
             num_workers=args.num_workers,
-            pin_memory=True,
+            pin_memory=pin_memory,
         )
 
     # Initialize decoder
@@ -2219,9 +2235,10 @@ python count_decoder.py --dataset data.npz --loss-type nb_libsize
     # Device and reproducibility
     parser.add_argument(
         "--device",
-        type=int,
-        default=0,
-        help="GPU id (use -1 for CPU preference).",
+        type=str,
+        default="auto",
+        help="'auto' (CUDA > MPS > CPU), 'cpu', 'mps', 'cuda' or 'cuda:N'. "
+             "Legacy GPU ids are still accepted (-1 for CPU).",
     )
     parser.add_argument("--seed", type=int, default=42)
     

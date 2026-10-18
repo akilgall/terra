@@ -430,7 +430,9 @@ def load_checkpoint(device: str,
     scaler:
         Torch scaler for automatic mixed precision training.
     is_training:
-        If 'True', load state dict into DDP module.
+        If 'True', load state dict into DDP module. A checkpoint that fails
+        to load is then logged and training starts from scratch. If 'False'
+        (inference / fine-tuning), the error is raised instead.
 
     Returns
     -----------
@@ -504,7 +506,12 @@ def load_checkpoint(device: str,
         del checkpoint
 
     except Exception as e:
-        logger.info(f'Encountered exception when loading checkpoint: {e}.')
+        # Inference and fine-tuning must never silently continue with
+        # randomly initialized weights.
+        if not is_training:
+            raise
+        logger.warning(f'Encountered exception when loading checkpoint: {e}. '
+                       'Starting from scratch.')
         epoch = 0
         iter_number = None
 

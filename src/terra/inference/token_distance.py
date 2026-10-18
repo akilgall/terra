@@ -15,6 +15,7 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     SamplesLoss = None
 
+from terra.utils.device import autocast, get_device, should_pin_memory
 from terra.utils.helper import init_model, load_checkpoint
 from terra.datasets.cell_datasets import init_cell_dataset
 from terra.datasets.dataloaders import init_dataloader_and_sampler
@@ -280,11 +281,8 @@ def infer_token_distance(
     n_special_values = model_config['data'].get('n_special_values', 0)
 
     logger.info('STEP 2: GENERATING TOKEN DISTANCES...')
-    if not torch.cuda.is_available():
-        inference_device = torch.device('cpu')
-    else:
-        inference_device = torch.device('cuda:0')
-        torch.cuda.set_device(inference_device)
+    inference_device = get_device()
+    pin_memory = should_pin_memory(inference_device, pin_memory)
 
     geomloss_device = device
     if geomloss_device is None:
@@ -395,9 +393,7 @@ def infer_token_distance(
         ns_tokens_original = udata_original['tokens'][:, n_special_tokens:]
         ns_tokens_perturbed = udata_perturbed['tokens'][:, n_special_tokens:]
 
-        with torch.cuda.amp.autocast(
-            dtype=torch.bfloat16,
-            enabled=model_config['meta']['use_bfloat16']):
+        with autocast(inference_device, model_config['meta']['use_bfloat16']):
             emb_layers = [emb_layer]
 
             full_ctx_original, cell_only_ctx_original = return_layer_emb_fn(
