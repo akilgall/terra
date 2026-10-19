@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning][].
     `meta.n_positions`), e.g. those exported after multi-stream fine-tuning.
     `embed_dataset(..., trim_padding=True)` skips trailing padding, which
     speeds up embedding of cell-only records under a long layout.
+-   `terra.tahoe.local` reads a full local Tahoe-100M download, either the
+    parquet shards or the Arrow files of a `datasets` cache. It counts cells
+    per well and cell line, selects and samples cells by organ, cell line,
+    drug, dose and plate, and reads only the chosen cells.
+    `terra.tahoe.convert.table_to_anndata` converts them to AnnData
+    column-wise. New notebook: `docs/notebooks/tahoe100m_exploration.ipynb`.
 -   `terra.evaluation.alignment`: metrics for spatial / Tahoe-100M alignment
     (domain mixing, paired-view similarity, per-drug separability and
     cross-line consistency of drug shifts, cell-type retention, collapse

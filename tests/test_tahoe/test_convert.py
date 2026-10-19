@@ -2,6 +2,7 @@
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pytest
 
 from terra.tahoe.convert import (
@@ -11,6 +12,7 @@ from terra.tahoe.convert import (
     records_to_anndata,
     restrict_to_vocab,
     sample_table,
+    table_to_anndata,
 )
 
 GENE_METADATA = pd.DataFrame({
@@ -121,3 +123,80 @@ def test_restrict_to_vocab_keeps_token_genes_only():
 
     assert restricted.var_names.tolist() == ["ENSG00000000001", "ENSG00000000004"]
     assert adata.n_vars == 4  # input untouched
+
+
+# ---------------------------------------------------------------------------
+# table_to_anndata: Arrow tables (columns of a parquet / Arrow download)
+# ---------------------------------------------------------------------------
+
+def _convert_table(table):
+    lut, var = gene_lookup(GENE_METADATA)
+    return table_to_anndata(table, lut, var, sample_table(SAMPLE_METADATA),
+                            cell_line_table(CELL_LINE_METADATA))
+
+
+def test_table_to_anndata_matches_records():
+    adata = _convert_table(pa.Table.from_pylist(RECORDS))
+
+    assert adata.X.toarray().tolist() == _adata().X.toarray().tolist()
+    pd.testing.assert_frame_equal(adata.obs, _adata().obs)
+
+
+def test_table_to_anndata_reads_chunked_and_sliced_columns():
+    table = pa.concat_tables([pa.Table.from_pylist(RECORDS[:2]),
+                              pa.Table.from_pylist(RECORDS[2:])])
+
+    whole = _convert_table(table)
+    tail = _convert_table(table.slice(1))
+
+    assert whole.X.toarray().tolist() == [[2, 0, 1, 0], [0, 7, 0, 0], [1, 1, 0, 3]]
+    assert tail.X.toarray().tolist() == [[0, 7, 0, 0], [1, 1, 0, 3]]
+    assert tail.obs["cell_id"].tolist() == ["b1", "b2"]
+
+
+def test_table_to_anndata_keeps_first_gene_without_cls_marker():
+    record = {**_record("b", [], []), "genes": [3, 5], "expressions": [4.0, 1.0]}
+
+    adata = _convert_table(pa.Table.from_pylist([record]))
+
+    assert adata.X.toarray().tolist() == [[4, 0, 1, 0]]
+
+
+def test_table_to_anndata_handles_cells_without_genes():
+    records = [_record("b0", [], []), {**_record("b1", [], []), "genes": [], "expressions": []},
+               _record("b2", [4], [2.0])]
+
+    adata = _convert_table(pa.Table.from_pylist(records))
+
+    assert adata.X.toarray().tolist() == [[0, 0, 0, 0], [0, 0, 0, 0], [0, 2, 0, 0]]
+
+
+def test_table_to_anndata_drops_unknown_tokens(caplog):
+    with caplog.at_level("WARNING"):
+        adata = _convert_table(pa.Table.from_pylist([_record("b", [3, 99], [2.0, 5.0])]))
+
+    assert adata.X.toarray().tolist() == [[2, 0, 0, 0]]
+    assert "Dropped 1 gene entries" in caplog.text
+
+
+@pytest.mark.parametrize(("record", "match"), [
+    ({**_record("bad", [3], [1.0]), "expressions": [-2.0]}, "length mismatch for bad"),
+    (_record("bad", [3], [1.5]), "Non-integer expression values in bad"),
+])
+def test_table_to_anndata_rejects_malformed_cells(record, match):
+    table = pa.Table.from_pylist([_record("ok", [3], [1.0]), record])
+
+    with pytest.raises(ValueError, match=match):
+        _convert_table(table)
+
+
+def test_table_to_anndata_names_missing_columns():
+    table = pa.Table.from_pylist(RECORDS).drop_columns(["plate"])
+
+    with pytest.raises(ValueError, match="plate"):
+        _convert_table(table)
+
+
+def test_table_to_anndata_rejects_empty_tables():
+    with pytest.raises(ValueError, match="No cells"):
+        _convert_table(pa.Table.from_pylist(RECORDS).slice(0, 0))

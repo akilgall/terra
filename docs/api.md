@@ -84,6 +84,30 @@ losses. See {doc}`tahoe_alignment`.
     collapse_stats
 ```
 
+### Tahoe-100M data
+
+Read a full local Tahoe-100M download (parquet shards or a `datasets` cache),
+select cells by well and cell line, and convert them to AnnData. See the
+{doc}`Tahoe-100M exploration notebook <notebooks/tahoe100m_exploration>`.
+
+```{eval-rst}
+.. currentmodule:: terra.tahoe
+
+.. autosummary::
+    :toctree: generated
+
+    open_expression_data
+    metadata_file
+    select_samples
+    select_cell_lines
+    cells_filter
+    cell_counts
+    read_obs
+    sample_per_group
+    read_cells
+    table_to_anndata
+```
+
 ## In-silico perturbation scoring
 
 Quantify a perturbation's effect on the embeddings — per cell, or summarized

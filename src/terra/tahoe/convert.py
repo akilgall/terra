@@ -1,4 +1,4 @@
-"""Convert Tahoe-100M ``expression_data`` records into an AnnData.
+"""Convert Tahoe-100M ``expression_data`` rows into an AnnData.
 
 Each record holds parallel ``genes`` (Tahoe vocabulary token ids) and
 ``expressions`` (raw UMI counts) lists, led by a CLS marker
@@ -13,6 +13,8 @@ from collections.abc import Iterable
 import anndata as ad
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
 import scipy.sparse as sp
 
 logger = logging.getLogger(__name__)
@@ -22,6 +24,7 @@ __all__ = [
     "gene_lookup",
     "sample_table",
     "cell_line_table",
+    "table_to_anndata",
     "records_to_anndata",
     "restrict_to_vocab",
 ]
@@ -30,6 +33,8 @@ __all__ = [
 CONTROL_DRUG = "DMSO_TF"
 _CATEGORICAL_OBS = ("drug", "sample", "plate", "cell_line_id", "cell_name",
                     "organ", "moa_fine")
+_TABLE_COLUMNS = ("genes", "expressions", "BARCODE_SUB_LIB_ID", "drug", "sample", "plate",
+                  "cell_line_id", "moa-fine", "pubchem_cid")
 
 
 def gene_lookup(gene_metadata: pd.DataFrame) -> tuple[np.ndarray, pd.DataFrame]:
@@ -88,41 +93,102 @@ def cell_line_table(cell_line_metadata: pd.DataFrame) -> pd.DataFrame:
                  .rename(columns={"Organ": "organ", "Cell_ID_DepMap": "depmap_id"}))
 
 
-def _pubchem_cid(value) -> object:
-    try:
-        return int(float(value))
-    except (TypeError, ValueError, OverflowError):
-        return pd.NA
+def _pubchem_cids(values: pd.Series) -> pd.Series:
+    """`'5288382.0'` -> 5288382; missing or unparsable ids -> NA."""
+    numbers = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    # Nullable integers: some compounds have no PubChem id, and h5ad cannot
+    # store a mixed int/NA object column.
+    return np.trunc(numbers).astype("Int64")
 
 
-def _record_counts(record: dict, lookup: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
-    """Columns and integer counts of one record (CLS marker dropped)."""
-    genes = np.asarray(record["genes"], dtype=np.int64)
-    counts = np.asarray(record["expressions"], dtype=np.float32)
-    if len(genes) != len(counts):
+def _require_columns(table: pa.Table) -> None:
+    missing = [c for c in _TABLE_COLUMNS if c not in table.column_names]
+    if missing:
+        raise ValueError(f"Tahoe-100M table lacks columns {missing}.")
+
+
+def _table_counts(table: pa.Table,
+                  lookup: np.ndarray,
+                  n_genes: int,
+                  ) -> tuple[sp.csr_matrix, int]:
+    """
+    Cells x genes counts of the `genes` / `expressions` list columns.
+
+    Drops each cell's CLS marker (a negative first expression) and gene
+    tokens absent from `lookup`; returns the matrix and the number dropped.
+    """
+    lengths = pc.list_value_length(table["genes"]).to_numpy(zero_copy_only=False)
+    expr_lengths = pc.list_value_length(table["expressions"]).to_numpy(zero_copy_only=False)
+    barcodes = table["BARCODE_SUB_LIB_ID"]
+    mismatched = np.flatnonzero(lengths != expr_lengths)
+    if mismatched.size:
         raise ValueError(
-            f"genes/expressions length mismatch for {record['BARCODE_SUB_LIB_ID']}.")
-    if len(counts) and counts[0] < 0:
-        genes, counts = genes[1:], counts[1:]
-    in_table = genes < len(lookup)
+            f"genes/expressions length mismatch for {barcodes[int(mismatched[0])]}.")
+    genes = pc.list_flatten(table["genes"]).to_numpy().astype(np.int64, copy=False)
+    counts = pc.list_flatten(table["expressions"]).to_numpy().astype(np.float32, copy=False)
+    ends = np.cumsum(lengths)
+    starts = ends - lengths
+
+    keep = np.ones(len(genes), dtype=bool)
+    nonempty = starts[lengths > 0]
+    keep[nonempty[counts[nonempty] < 0]] = False  # CLS marker
     columns = np.full(len(genes), -1, dtype=np.int64)
+    in_table = (genes >= 0) & (genes < len(lookup))
     columns[in_table] = lookup[genes[in_table]]
-    keep = columns >= 0
-    if not np.all(np.mod(counts[keep], 1) == 0):
-        raise ValueError(
-            f"Non-integer expression values in {record['BARCODE_SUB_LIB_ID']}; "
-            "expected raw counts.")
-    return columns[keep], counts[keep].astype(np.int32), int((~keep).sum())
+    n_dropped = int((keep & (columns < 0)).sum())
+    keep &= columns >= 0
+
+    fractional = np.flatnonzero(keep & (np.mod(counts, 1) != 0))
+    if fractional.size:
+        row = int(np.searchsorted(starts, fractional[0], side="right")) - 1
+        raise ValueError(f"Non-integer expression values in {barcodes[row]}; "
+                         "expected raw counts.")
+    kept_before = np.concatenate([[0], np.cumsum(keep)])
+    indptr = np.concatenate([[0], kept_before[ends]])
+    X = sp.csr_matrix((counts[keep].astype(np.int32), columns[keep], indptr),
+                      shape=(table.num_rows, n_genes))
+    return X, n_dropped
 
 
-def _obs_row(record: dict) -> dict:
-    return {"cell_id": record["BARCODE_SUB_LIB_ID"],
-            "drug": record["drug"].strip(),
-            "sample": record["sample"],
-            "plate": record["plate"],
-            "cell_line_id": record["cell_line_id"],
-            "moa_fine": record["moa-fine"],
-            "pubchem_cid": _pubchem_cid(record["pubchem_cid"])}
+def _table_obs(table: pa.Table) -> pd.DataFrame:
+    meta = table.select(list(_TABLE_COLUMNS[2:])).to_pandas()
+    return pd.DataFrame({"cell_id": meta["BARCODE_SUB_LIB_ID"].astype(str),
+                         "drug": meta["drug"].str.strip(),
+                         "sample": meta["sample"],
+                         "plate": meta["plate"],
+                         "cell_line_id": meta["cell_line_id"],
+                         "moa_fine": meta["moa-fine"],
+                         "pubchem_cid": _pubchem_cids(meta["pubchem_cid"])})
+
+
+def table_to_anndata(table: pa.Table,
+                     lookup: np.ndarray,
+                     var: pd.DataFrame,
+                     samples: pd.DataFrame,
+                     cell_lines: pd.DataFrame,
+                     ) -> ad.AnnData:
+    """
+    Convert an Arrow table of `expression_data` rows to an AnnData of raw counts.
+
+    Works column-wise, without a per-cell Python loop. `obs` holds `cell_id`
+    (the record barcode), `drug`, `sample`, `plate`, `cell_line_id`,
+    `moa_fine`, `pubchem_cid`, the dose columns from `samples`, `cell_name` /
+    `organ` / `depmap_id` from `cell_lines`, and `is_control`
+    (`drug == 'DMSO_TF'`).
+    """
+    _require_columns(table)
+    if table.num_rows == 0:
+        raise ValueError("No cells to convert.")
+    X, n_dropped = _table_counts(table, lookup, var.shape[0])
+    if n_dropped:
+        logger.warning(f"Dropped {n_dropped} gene entries absent from gene_metadata.")
+    obs = _table_obs(table)
+    obs = obs.join(samples, on="sample").join(cell_lines, on="cell_line_id")
+    obs["is_control"] = obs["drug"].eq(CONTROL_DRUG)
+    obs.index = pd.Index(obs["cell_id"].to_numpy(), name="barcode")
+    for col in _CATEGORICAL_OBS:
+        obs[col] = obs[col].astype("category")
+    return ad.AnnData(X=X, obs=obs, var=var.copy())
 
 
 def records_to_anndata(records: Iterable[dict],
@@ -131,40 +197,11 @@ def records_to_anndata(records: Iterable[dict],
                        samples: pd.DataFrame,
                        cell_lines: pd.DataFrame,
                        ) -> ad.AnnData:
-    """
-    Convert expression records to an AnnData of raw integer counts.
-
-    `obs` holds `cell_id` (the record barcode), `drug`, `sample`, `plate`,
-    `cell_line_id`, `moa_fine`, `pubchem_cid`, the dose columns from
-    `samples`, `cell_name` / `organ` / `depmap_id` from `cell_lines`, and
-    `is_control` (`drug == 'DMSO_TF'`).
-    """
-    data, indices, indptr, obs_rows = [], [], [0], []
-    n_dropped = 0
-    for record in records:
-        columns, counts, dropped = _record_counts(record, lookup)
-        data.append(counts)
-        indices.append(columns)
-        indptr.append(indptr[-1] + len(columns))
-        obs_rows.append(_obs_row(record))
-        n_dropped += dropped
-    if not obs_rows:
+    """Convert expression records (row dicts) to an AnnData; see `table_to_anndata`."""
+    records = list(records)
+    if not records:
         raise ValueError("No records to convert.")
-    if n_dropped:
-        logger.warning(f"Dropped {n_dropped} gene entries absent from gene_metadata.")
-    X = sp.csr_matrix(
-        (np.concatenate(data), np.concatenate(indices), np.asarray(indptr)),
-        shape=(len(obs_rows), var.shape[0]), dtype=np.int32)
-    obs = pd.DataFrame(obs_rows)
-    obs = obs.join(samples, on="sample").join(cell_lines, on="cell_line_id")
-    obs["is_control"] = obs["drug"].eq(CONTROL_DRUG)
-    # Nullable integers: some compounds have no PubChem id, and h5ad cannot
-    # store a mixed int/NA object column.
-    obs["pubchem_cid"] = obs["pubchem_cid"].astype("Int64")
-    obs.index = pd.Index(obs["cell_id"].to_numpy(), name="barcode")
-    for col in _CATEGORICAL_OBS:
-        obs[col] = obs[col].astype("category")
-    return ad.AnnData(X=X, obs=obs, var=var.copy())
+    return table_to_anndata(pa.Table.from_pylist(records), lookup, var, samples, cell_lines)
 
 
 def restrict_to_vocab(adata: ad.AnnData, token_dict: dict) -> ad.AnnData:
