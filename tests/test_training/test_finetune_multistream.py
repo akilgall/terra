@@ -9,7 +9,7 @@ import yaml
 datasets = pytest.importorskip("datasets")
 anndata = pytest.importorskip("anndata")
 
-from tiny_terra import NORMS, make_adata, make_bundle, tokenize  # noqa: E402
+from tiny_terra import NORMS, make_adata, make_bundle, skip_without_squidpy, tokenize  # noqa: E402
 
 from terra.tokenizers.cell_tokenizers import CellGraphTokenizer  # noqa: E402
 from terra.training.finetune_self_supervised import (  # noqa: E402
@@ -256,6 +256,7 @@ def test_example_config_is_valid():
 
 
 def test_legacy_loop_still_trains_and_exports(tmp_path):
+    skip_without_squidpy()
     bundle = make_bundle(tmp_path / "bundle")
     tk = CellGraphTokenizer(nproc=1, model_input_size=12, n_neighs=2,
                             token_dictionary_file_path=str(bundle / "token_dictionary.pkl"),

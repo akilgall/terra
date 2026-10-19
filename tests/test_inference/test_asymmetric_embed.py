@@ -10,7 +10,7 @@ import yaml
 datasets = pytest.importorskip("datasets")
 pytest.importorskip("anndata")
 
-from tiny_terra import make_adata, make_bundle  # noqa: E402
+from tiny_terra import make_adata, make_bundle, skip_without_squidpy  # noqa: E402
 
 from terra.datasets.segment_layout import config_layout_kwargs  # noqa: E402
 from terra.inference.embed import embed_dataset  # noqa: E402
@@ -57,6 +57,8 @@ def asymmetric_bundle(tmp_path):
 
 
 def _tokenize(bundle, tmp_path, spatial):
+    if spatial:
+        skip_without_squidpy()
     return tokenize_adata(make_adata(8, spatial, seed=3), str(bundle), str(tmp_path / "cache"),
                           nproc=1, processing_mode="sequential", use_generator=False)
 

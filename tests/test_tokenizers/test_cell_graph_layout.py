@@ -7,7 +7,7 @@ empty neighbour becomes an all-padding slot, later slots do not move).
 Cell-only mode (Tahoe-100M cells, which have no coordinates) skips the spatial
 graph and stores only the centre segment.
 
-``LEGACY_SHA256`` was produced by the unmodified base code (commit 4bf0ad6).
+``LEGACY_SHA256`` was produced by the unmodified upstream tokenizer (main, 6cb235f).
 """
 
 import hashlib
@@ -17,20 +17,25 @@ import anndata as ad
 import numpy as np
 import pytest
 import yaml
+from tiny_terra import skip_without_squidpy
 
 from terra.inference.tokenize import tokenize_adata
 from terra.tokenizers.cell_tokenizers import CellGraphTokenizer
 
 N_CELLS, N_GENES = 10, 8
-LEGACY_SHA256 = "608a6f08d49bd53e66efe7c2dd6a4df9dff41f01daecabc936397b2aabf40327"
+LEGACY_SHA256 = "d253542d601d0f1813819b156c4f6ae616baac545cb6d7c7186b457867752c57"
 NORMS = {"rank_cell_norm_method": None, "rank_gene_norm_method": None,
          "rank_count_norm_method": None, "count_cell_norm_method": None,
          "count_gene_norm_method": None, "count_count_norm_method": "shifted_log"}
 
 
 def _adata() -> ad.AnnData:
+    # Distinct counts within each cell: the tokenizer orders genes with an
+    # unstable argsort, whose order for tied counts differs between platforms
+    # (e.g. x86 Linux and Apple Silicon), so ties would make the digest
+    # platform-dependent.
     rng = np.random.default_rng(42)
-    counts = rng.poisson(1.5, size=(N_CELLS, N_GENES)).astype(np.float32)
+    counts = np.stack([rng.permutation(N_GENES) for _ in range(N_CELLS)]).astype(np.float32)
     counts[3, :] = 0.0
     counts[3, 0] = 1.0  # sparse cell
     genes = [f"ENSG{idx:011d}" for idx in range(1, N_GENES + 1)]
@@ -54,6 +59,8 @@ def token_path(tmp_path) -> str:
 
 
 def _tokenize(adata, token_path, model_input_size=12, n_neighs=2, **kwargs):
+    if not kwargs.get("cell_only"):
+        skip_without_squidpy()
     tk = CellGraphTokenizer(
         nproc=1, processing_mode="sequential", model_input_size=model_input_size,
         n_neighs=n_neighs, token_dictionary_file_path=token_path,
@@ -62,10 +69,13 @@ def _tokenize(adata, token_path, model_input_size=12, n_neighs=2, **kwargs):
 
 
 def _digest(ds) -> str:
+    # Expression values are float32 log1p of the counts 1..7, whose last bits
+    # depend on the platform's log1p; at 3 decimals each lies >5e-5 from a
+    # rounding boundary.
     h = hashlib.sha256()
     for row in ds:
         h.update(np.asarray(row["gene_tokens"], dtype=np.int64).tobytes())
-        h.update(np.asarray(row["gene_expr"], dtype=np.float64).tobytes())
+        h.update(np.round(np.asarray(row["gene_expr"], dtype=np.float64), 3).tobytes())
         h.update(np.asarray(row["rel_x_coord"], dtype=np.float64).tobytes())
         h.update(np.asarray(row["rel_y_coord"], dtype=np.float64).tobytes())
         h.update(str(row["n_nonzero_tokens"]).encode())
@@ -196,6 +206,7 @@ def _model_folder(tmp_path, token_path, **data_overrides) -> str:
 
 
 def test_tokenize_adata_uses_config_budgets(tmp_path, token_path):
+    skip_without_squidpy()
     folder = _model_folder(tmp_path, token_path)
 
     ds = tokenize_adata(_adata(), folder, str(tmp_path / "cache"), nproc=1,

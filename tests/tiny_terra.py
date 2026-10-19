@@ -8,6 +8,7 @@ import pickle
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 import yaml
 
@@ -23,6 +24,12 @@ META = {"gt_type": "combined", "count_encoding": "mlp", "n_value_bins": 100,
         "api_version": "v3", "predict_gene": True, "pos_learnable": False,
         "special_tokens": [], "use_bfloat16": False, "restrict_special_attention": False}
 SEEN_GENES = 5  # genes listed in gene_count_dictionary.pkl ("seen in pretraining")
+
+
+def skip_without_squidpy() -> None:
+    """Skip the calling test when squidpy, which builds the spatial neighbour
+    graph, cannot be imported (e.g. squidpy 1.8 with a scanpy 1.13 pre-release)."""
+    pytest.importorskip("squidpy")
 
 
 def genes() -> list[str]:
@@ -90,6 +97,8 @@ def tokenize(bundle: Path, adata, cell_only: bool, out: Path, **layout):
     from terra.tahoe.labels import DOMAIN_SPATIAL, DOMAIN_TAHOE, LabelCodes, add_value_columns
     from terra.tokenizers.cell_tokenizers import CellGraphTokenizer
 
+    if not cell_only:
+        skip_without_squidpy()
     layout = {"model_input_size": 12, "seq_len_cell": 6, "seq_len_neigh": 3, **layout}
     tk = CellGraphTokenizer(nproc=1, n_neighs=2,
                             token_dictionary_file_path=str(bundle / "token_dictionary.pkl"),
