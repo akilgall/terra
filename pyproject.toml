@@ -72,9 +72,10 @@ dependencies = [
     "scib-metrics>=0.5",
     "scikit-misc>=0.3",
     "transformers>=4.44",
-    # torch is given a deliberately broad floor: the CUDA build must match the
-    # user's NVIDIA driver and is installed separately (see the README), so we
-    # must not force an upgrade to a specific CUDA wheel here.
+    # torch is given a deliberately broad floor: the build must match the
+    # user's hardware (a CUDA wheel matching the NVIDIA driver, or the default
+    # wheel with MPS on Apple Silicon) and is installed separately (see the
+    # README), so we must not force an upgrade to a specific wheel here.
     "torch>=2.1",
     # Cap below 5.0: datasets 5.x changed Dataset column handling and breaks
     # perturb_dataset's per-perturbation flag columns (tested-good is 4.x).

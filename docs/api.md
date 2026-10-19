@@ -53,6 +53,37 @@ unfreezing, with LoRA available as an alternative. See the
     filter_dataset_by_cell_ids
 ```
 
+## Self-supervised finetuning and Tahoe-100M alignment
+
+Continue the JEPA objective on new data with LoRA, optionally across several
+data streams (spatial, spatial without neighbours, Tahoe-100M) with alignment
+losses. See {doc}`tahoe_alignment`.
+
+```{eval-rst}
+.. currentmodule:: terra.training.finetune_self_supervised
+
+.. autosummary::
+    :toctree: generated
+
+    finetune_self_supervised
+    prepare_finetuned_model
+```
+
+```{eval-rst}
+.. currentmodule:: terra.evaluation.alignment
+
+.. autosummary::
+    :toctree: generated
+
+    evaluate_alignment
+    domain_mixing
+    paired_view_similarity
+    perturbation_separability
+    perturbation_vector_consistency
+    label_retention
+    collapse_stats
+```
+
 ## In-silico perturbation scoring
 
 Quantify a perturbation's effect on the embeddings — per cell, or summarized

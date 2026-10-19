@@ -68,6 +68,7 @@ If you find TERRA useful for your research, please consider citing the manuscrip
 installation
 tutorials
 user_guide
+tahoe_alignment
 api
 changelog
 contributing

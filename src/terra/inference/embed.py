@@ -20,12 +20,15 @@ from tqdm import tqdm
 from pyensembl import EnsemblRelease
 from scipy.sparse import issparse
 
+from terra.utils.device import autocast, get_device, should_pin_memory
 from terra.utils.helper import (init_model, load_checkpoint, parse_arch_kwargs,
                        parse_protein_init_kwargs)
 from terra.datasets.cell_datasets import CellBaseDataset, init_cell_dataset
+from terra.datasets.segment_layout import config_layout_kwargs
 from terra.datasets.dataloaders import init_dataloader_and_sampler
 from terra.masks.block_masking  import BlockMaskCollator
 from terra.masks.cell_masking import CellMaskCollator
+from terra.masks.utils import trim_trailing_pad
 from terra.tokenizers import cell_tokenizers
 from terra.utils.embedding import (create_binary_selection_mask,
                                        compute_mean_unmasked_emb,
@@ -51,6 +54,14 @@ torch.backends.cudnn.benchmark = True
 logger = logging.getLogger(__name__)
 
 
+def _trim_attention(masks_attention: torch.Tensor, length: int) -> torch.Tensor:
+    """Cut a [B, 1, 1 | L, L] attention mask to the first `length` tokens."""
+    masks_attention = masks_attention[..., :length]
+    if masks_attention.shape[-2] > 1:
+        masks_attention = masks_attention[..., :length, :]
+    return masks_attention
+
+
 @torch.inference_mode()
 def embed_dataset(dataset: Dataset,
                   model_folder_path: str,
@@ -65,6 +76,8 @@ def embed_dataset(dataset: Dataset,
                   ignore_spc_tokens: bool = True,
                   agg_type: Literal['avg',
                                     'softmax'] = 'avg',
+                  device: str | None = None,
+                  trim_padding: bool = False,
                   ) -> dict:
     """
     Embed a tokenized dataset, returning cell-, neighborhood- and gene-level embeddings.
@@ -100,6 +113,14 @@ def embed_dataset(dataset: Dataset,
         How gene embeddings are aggregated into cell and neighborhood
         embeddings (`'avg'` for an unweighted mean or `'softmax'` for a
         count-softmax-weighted mean).
+    device:
+        Device for model inference: `None`/`'auto'` (CUDA > MPS > CPU),
+        `'cpu'`, `'mps'` or `'cuda:N'`.
+    trim_padding:
+        If `True`, cut each batch after its last non-padding token before the
+        forward pass. Exact, and much faster for cell-only records (e.g.
+        Tahoe-100M) under a long layout, whose neighbour slots are all
+        padding. Not combinable with `return_token_embeddings`.
 
     Returns
     -----------
@@ -111,6 +132,10 @@ def embed_dataset(dataset: Dataset,
         `return_token_embeddings` is `True`, also contains ``token_emb``
         (per-token embeddings).
     """
+    if trim_padding and return_token_embeddings:
+        raise ValueError("trim_padding gives batches of different lengths; it "
+                         "cannot be combined with return_token_embeddings.")
+
     logger.info('STEP 1: LOADING CONFIG...')
     model_config_file_path = Path(model_folder_path) / 'model_config.yaml'
     token_dictionary_file_path = Path(model_folder_path) / 'token_dictionary.pkl'
@@ -120,6 +145,7 @@ def embed_dataset(dataset: Dataset,
     # Load model config
     with open(model_config_file_path, 'r') as file:
         model_config = yaml.safe_load(file)
+    layout_kwargs = config_layout_kwargs(model_config)
 
     # Get token sequence length and number of special tokens
     n_special_tokens = len(model_config['meta']['special_tokens'])
@@ -146,11 +172,8 @@ def embed_dataset(dataset: Dataset,
 
     logger.info('STEP 2: GENERATING EMBEDDINGS...')
     # Set device
-    if not torch.cuda.is_available():
-        device = torch.device('cpu')
-    else:
-        device = torch.device('cuda:0')
-        torch.cuda.set_device(device)
+    device = get_device(device)
+    pin_memory = should_pin_memory(device, pin_memory)
 
     # Initialize encoder, predictor, and target encoder
     target_encoder, _ = init_model(
@@ -179,7 +202,8 @@ def embed_dataset(dataset: Dataset,
         mlp_bias=model_config['meta'].get('mlp_bias', True),
         protein_init_kwargs=parse_protein_init_kwargs(
             model_config, token_dict),
-        **parse_arch_kwargs(model_config))
+        **parse_arch_kwargs(model_config),
+        **layout_kwargs.model)
 
     if model_config['meta']['api_version'] != 'v3':
         return_layer_emb_fn = target_encoder.return_layer_emb
@@ -198,7 +222,8 @@ def embed_dataset(dataset: Dataset,
         sample_segments=False,
         sample_gene_masks=False,
         restrict_special_attention=model_config['meta']['restrict_special_attention'],
-        special_token_pad_ratio=1.0)
+        special_token_pad_ratio=1.0,
+        **layout_kwargs.masker)
         
     # Create torch dataset
     cell_dataset = init_cell_dataset(
@@ -216,7 +241,8 @@ def embed_dataset(dataset: Dataset,
         sep_gene_tokens_neb=model_config['data']['sep_gene_tokens_neb'],
         pad_special_tokens=True,
         truncate_neighbors=model_config['data'].get('truncate_neighbors', False),
-        tokenized_seq_len_cell=model_config['data'].get('tokenized_seq_len_cell', None),)
+        tokenized_seq_len_cell=model_config['data'].get('tokenized_seq_len_cell', None),
+        **layout_kwargs.dataset)
 
     # Initialize dataloader
     loader, _ = init_dataloader_and_sampler(
@@ -257,14 +283,16 @@ def embed_dataset(dataset: Dataset,
             if key != 'cell_id':
                 udata[key] = udata[key].to(device, non_blocking=True)
         masks_attention = masks_attention.to(device, non_blocking=True)
+        if trim_padding:
+            udata = trim_trailing_pad(udata)
+            masks_attention = _trim_attention(masks_attention,
+                                              udata['tokens'].shape[1])
 
         # Aggregate gene embeddings into cell and neighborhood embeddings
         ns_tokens = udata['tokens'][:, n_special_tokens:]
 
         # Retrieve gene embeddings from different layers
-        with torch.cuda.amp.autocast(
-            dtype=torch.bfloat16,
-            enabled=model_config['meta']['use_bfloat16']):
+        with autocast(device, model_config['meta']['use_bfloat16']):
 
             emb_layers = [emb_layer]
 
@@ -308,7 +336,8 @@ def embed_dataset(dataset: Dataset,
                 excluded_tokens=agg_excluded_tokens,
                 seq_len_cell=model_config['data']['seq_len_cell'],
                 top_k=top_k,
-                n_segments=model_config['data']['n_segments']).cpu()
+                n_segments=model_config['data']['n_segments'],
+                **layout_kwargs.selection).cpu()
 
         # Average gene embeddings into cell and neighborhood embedding
         if agg_type == 'avg':                    
@@ -387,6 +416,7 @@ def harmonize_tokenize_embed_pipeline(
         ignore_spc_tokens: bool = True,
         agg_type: Literal['avg',
                     'softmax'] = 'avg',
+        device: str | None = None,
         ) -> ad.AnnData:
     """
     Harmonize, tokenize and embed an AnnData object.
@@ -468,6 +498,9 @@ def harmonize_tokenize_embed_pipeline(
     agg_type:
         How gene embeddings are aggregated into cell and neighborhood
         embeddings (`'avg'` or `'softmax'`).
+    device:
+        Device for model inference: `None`/`'auto'` (CUDA > MPS > CPU),
+        `'cpu'`, `'mps'` or `'cuda:N'`.
 
     Returns
     -----------
@@ -598,7 +631,8 @@ def harmonize_tokenize_embed_pipeline(
         pin_memory=pin_memory,
         num_workers=num_workers,
         ignore_spc_tokens=ignore_spc_tokens,
-        agg_type=agg_type)
+        agg_type=agg_type,
+        device=device)
     logger.info(f"Embedded tokenized data.")
 
     # Add embeddings to adata
@@ -626,6 +660,7 @@ def gene_embed_dataset(dataset: Dataset,
                        include_spatial_cell_emb: bool = True,
                        description: str='',
                        ignore_spc_tokens: bool = True,
+                       device: str | None = None,
                        ) -> tuple | dict | None:
     """
     Compute per-gene embeddings or co-occurrence statistics over a tokenized dataset.
@@ -673,6 +708,9 @@ def gene_embed_dataset(dataset: Dataset,
         Description for task that is currently using this function.
     ignore_spc_tokens:
         Whether to ignore special tokens when retrieving layer embeddings.
+    device:
+        Device for model inference: `None`/`'auto'` (CUDA > MPS > CPU),
+        `'cpu'`, `'mps'` or `'cuda:N'`.
 
     Returns
     -----------
@@ -706,6 +744,7 @@ def gene_embed_dataset(dataset: Dataset,
     # Load model config
     with open(model_config_file_path, 'r') as file:
         model_config = yaml.safe_load(file)
+    layout_kwargs = config_layout_kwargs(model_config)
 
     # Get token sequence length and number of special tokens
     n_special_tokens = len(model_config['meta']['special_tokens'])
@@ -726,11 +765,8 @@ def gene_embed_dataset(dataset: Dataset,
 
     logger.info(f'STEP 2: {description}')
     # Set device
-    if not torch.cuda.is_available():
-        device = torch.device('cpu')
-    else:
-        device = torch.device('cuda:0')
-        torch.cuda.set_device(device)
+    device = get_device(device)
+    pin_memory = should_pin_memory(device, pin_memory)
 
     # Initialize encoder, predictor, and target encoder
     target_encoder, _ = init_model(
@@ -760,6 +796,7 @@ def gene_embed_dataset(dataset: Dataset,
         protein_init_kwargs=parse_protein_init_kwargs(
             model_config, token_dict),
         **parse_arch_kwargs(model_config),
+        **layout_kwargs.model,
         )
 
     if model_config['meta']['api_version'] != 'v3':
@@ -779,7 +816,8 @@ def gene_embed_dataset(dataset: Dataset,
         sample_segments=False,
         sample_gene_masks=False,
         restrict_special_attention=model_config['meta']['restrict_special_attention'],
-        special_token_pad_ratio=1.0)
+        special_token_pad_ratio=1.0,
+        **layout_kwargs.masker)
         
     # Create torch dataset
     cell_dataset = init_cell_dataset(
@@ -797,7 +835,8 @@ def gene_embed_dataset(dataset: Dataset,
         sep_gene_tokens_neb=model_config['data']['sep_gene_tokens_neb'],
         pad_special_tokens=True,
         truncate_neighbors=model_config['data'].get('truncate_neighbors', False),
-        tokenized_seq_len_cell=model_config['data'].get('tokenized_seq_len_cell', None),)
+        tokenized_seq_len_cell=model_config['data'].get('tokenized_seq_len_cell', None),
+        **layout_kwargs.dataset)
 
     # Initialize dataloader
     loader, _ = init_dataloader_and_sampler(
@@ -850,9 +889,7 @@ def gene_embed_dataset(dataset: Dataset,
         ns_tokens = udata['tokens'][:, n_special_tokens:]
 
         # Retrieve gene embeddings from different layers
-        with torch.cuda.amp.autocast(
-            dtype=torch.bfloat16,
-            enabled=model_config['meta']['use_bfloat16']):
+        with autocast(device, model_config['meta']['use_bfloat16']):
 
             emb_layers = [emb_layer]
 

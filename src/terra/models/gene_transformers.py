@@ -15,6 +15,7 @@ from typing import Dict, Literal, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from .adaln import zero_init_adaln_modulations
 from .modules import Attention, Block, MLP, ValueEmbWeightsProjection
@@ -38,6 +39,60 @@ from ..masks.utils import apply_masks
 logger = logging.getLogger(__name__)
 
 DEBUG = False
+
+
+def _eigh(matrix: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    ``torch.linalg.eigh`` with a CPU fallback for backends that lack it
+    (e.g. MPS before torch 2.10). The Laplacian matrices decomposed here are
+    small (n_cells x n_cells), so the round trip is cheap.
+    """
+    try:
+        return torch.linalg.eigh(matrix)
+    except NotImplementedError:
+        if matrix.device.type == "cpu":
+            raise
+        eigvals, eigvecs = torch.linalg.eigh(matrix.cpu())
+        return eigvals.to(matrix.device), eigvecs.to(matrix.device)
+
+
+def _block_has_randomness(blk: nn.Module) -> bool:
+    """Whether a block draws random numbers in training (dropout, RoPE
+    rotation augmentation)."""
+    for module in blk.modules():
+        if isinstance(module, nn.Dropout) and module.p > 0:
+            return True
+        if isinstance(module, RoPE2D) and module.rotation_augment:
+            return True
+    return False
+
+
+def run_block(owner: nn.Module,
+              blk: nn.Module,
+              x: torch.Tensor,
+              **block_kwargs,
+              ) -> torch.Tensor:
+    """
+    Run one transformer block, with gradient checkpointing when the owning
+    encoder/predictor enables it (training with gradients only).
+
+    Raises
+    ----------
+    RuntimeError
+        On MPS when the block has dropout or random RoPE rotations: torch does
+        not replay MPS random masks during recomputation, so the gradients
+        would be wrong.
+    """
+    if not (getattr(owner, 'grad_checkpointing', False) and owner.training
+            and torch.is_grad_enabled()):
+        return blk(x, **block_kwargs)
+    if x.device.type == 'mps' and _block_has_randomness(blk):
+        raise RuntimeError(
+            "Gradient checkpointing on MPS cannot replay dropout or random "
+            "RoPE rotations inside a block (torch does not restore the MPS "
+            "RNG), so gradients would be wrong. Set dropout (including LoRA "
+            "peft_dropout) to 0 or disable grad_checkpointing.")
+    return checkpoint(blk, x, use_reentrant=False, **block_kwargs)
 
 
 class GeneTransformerBaseEncoder(ABC, nn.Module):
@@ -132,13 +187,32 @@ class GeneTransformerBaseEncoder(ABC, nn.Module):
                  rope_rotation_augment: bool = True,
                  adaln_kwargs: dict | None = None,
                  rda_kwargs: dict | None = None,
+                 seq_len_cell: int | None = None,
+                 n_positions: int | None = None,
+                 grad_checkpointing: bool = False,
                  **kwargs
                  ):
         super().__init__()
         self.seq_len = seq_len
         self.n_segments = n_segments
         self.n_special_tokens = n_special_tokens
-        self.seq_len_cell = (seq_len - n_special_tokens)//n_segments
+        # Centre-cell slots. Derived by an even split for the pretrained
+        # uniform layout; passed explicitly for the asymmetric layout.
+        self.seq_len_cell = (seq_len_cell if seq_len_cell is not None
+                             else (seq_len - n_special_tokens)//n_segments)
+        # Rows of the frozen sincos position table (positions are per-segment
+        # ranks, so this need not equal seq_len).
+        self.n_positions = n_positions if n_positions is not None else seq_len
+        self.grad_checkpointing = grad_checkpointing
+        uniform_layout = (
+            self.seq_len_cell * n_segments == seq_len - n_special_tokens)
+        rda_on = bool(rda_kwargs) and rda_kwargs.get('enabled', False)
+        if not uniform_layout and (cell_pos_enc == 'laplacian' or rda_on):
+            raise ValueError(
+                "cell_pos_enc='laplacian' and RDA conditioning need a uniform "
+                "segment layout (every segment seq_len_cell slots); got "
+                f"seq_len_cell={self.seq_len_cell}, n_segments={n_segments}, "
+                f"seq_len={seq_len}.")
         self.cell_pos_enc = cell_pos_enc
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -488,7 +562,7 @@ class GeneTransformerBaseEncoder(ABC, nn.Module):
         if DEBUG:
             valid_mask = x.ne(0).any(dim=-1)
         for i, blk in enumerate(self.blocks, start=1):
-            x = blk(x, masks=attn, coords=coords, cond=cond)
+            x = run_block(self, blk, x, masks=attn, coords=coords, cond=cond)
             if i == len(self.blocks) and (self.norm is not None):
                 # Apply norm only for last layer as in training
                 x = self.norm(x)
@@ -798,7 +872,7 @@ class GeneTransformerBaseEncoder(ABC, nn.Module):
         with torch.no_grad():
             # eigh returns ascending eigenvalues. Skip the smallest
             # (trivial zero/near-zero eigenvalue) and take the next k.
-            _, eigvecs = torch.linalg.eigh(lap)              # (B, c, c)
+            _, eigvecs = _eigh(lap)                          # (B, c, c)
             pe = eigvecs[:, :, 1: self.laplacian_k + 1].contiguous()
             # Resolve sign ambiguity by convention: first non-missing
             # entry of each eigenvector is forced positive. (Eigvecs
@@ -917,7 +991,7 @@ class GeneTransformerBaseEncoder(ABC, nn.Module):
                     * deg_inv_sqrt.unsqueeze(-1)
                     * deg_inv_sqrt.unsqueeze(-2))
         lap = (eye.to(adj.dtype) - norm_adj)
-        eigvals, _ = torch.linalg.eigh(lap)  # (B, c) ascending
+        eigvals, _ = _eigh(lap)  # (B, c) ascending
         # Skip the smallest (~0) eigenvalue; use means across the batch.
         nontrivial = eigvals[:, 1:]
         eig_min = nontrivial[:, 0].mean()
@@ -1205,11 +1279,15 @@ class GeneTransformerBasePredictor(ABC, nn.Module):
                  rope_rotation_augment: bool = True,
                  adaln_kwargs: dict | None = None,
                  special_token_moe_kwargs: dict | None = None,
+                 n_positions: int | None = None,
+                 grad_checkpointing: bool = False,
                  **kwargs
                  ):
         super().__init__()
         self.embed_dim = embed_dim
         self.seq_len = seq_len
+        self.n_positions = n_positions if n_positions is not None else seq_len
+        self.grad_checkpointing = grad_checkpointing
         self.n_special_tokens = n_special_tokens
         self.cell_pos_enc = cell_pos_enc
         self.predictor_embed_dim = predictor_embed_dim
@@ -1728,7 +1806,7 @@ class GeneTransformerRankEncoder(GeneTransformerBaseEncoder):
         super().__init__(**base_encoder_kwargs)
 
         # Initialize positional embeddings
-        self.pos_embed = nn.Embedding(self.seq_len + 1, # include <pad>
+        self.pos_embed = nn.Embedding(self.n_positions + 1, # include <pad>
                                       self.embed_dim,
                                       padding_idx=0)
 
@@ -1739,7 +1817,7 @@ class GeneTransformerRankEncoder(GeneTransformerBaseEncoder):
             pos_embed = get_1d_sincos_pos_embed(
                 embed_dim=self.embed_dim,
                 n_zero_pos=0,
-                n_sincos_pos=self.seq_len)
+                n_sincos_pos=self.n_positions)
             self.pos_embed.weight[1:].copy_(
                 torch.from_numpy(pos_embed).float())
 
@@ -1825,7 +1903,8 @@ class GeneTransformerRankEncoder(GeneTransformerBaseEncoder):
 
             # Run forward prop
             for i, blk in enumerate(self.blocks):
-                x = blk(x, masks=attn_bias, coords=coords, cond=cond)
+                x = run_block(self, blk, x, masks=attn_bias, coords=coords,
+                              cond=cond)
             if self.norm is not None:
                 x = self.norm(x)
 
@@ -2092,7 +2171,8 @@ class GeneTransformerCountEncoder(GeneTransformerBaseEncoder):
 
         # Run forward prop
         for i, blk in enumerate(self.blocks):
-            x = blk(x, masks=attn_bias, coords=coords, cond=cond)
+            x = run_block(self, blk, x, masks=attn_bias, coords=coords,
+                          cond=cond)
         if self.norm is not None:
             x = self.norm(x)
 
@@ -2263,7 +2343,7 @@ class GeneTransformerCombinedEncoder(GeneTransformerBaseEncoder):
         self.n_value_bins = n_value_bins
 
         # Initialize positional embeddings
-        self.pos_embed = nn.Embedding(self.seq_len + 1, # include <pad>
+        self.pos_embed = nn.Embedding(self.n_positions + 1, # include <pad>
                                       self.embed_dim,
                                       padding_idx=0)
 
@@ -2274,7 +2354,7 @@ class GeneTransformerCombinedEncoder(GeneTransformerBaseEncoder):
             pos_embed = get_1d_sincos_pos_embed(
                 embed_dim=self.embed_dim,
                 n_zero_pos=0,
-                n_sincos_pos=self.seq_len)
+                n_sincos_pos=self.n_positions)
             self.pos_embed.weight[1:].copy_(
                 torch.from_numpy(pos_embed).float())
 
@@ -2426,7 +2506,8 @@ class GeneTransformerCombinedEncoder(GeneTransformerBaseEncoder):
 
         # Run forward prop
         for i, blk in enumerate(self.blocks):
-            x = blk(x, masks=attn_bias, coords=coords, cond=cond)
+            x = run_block(self, blk, x, masks=attn_bias, coords=coords,
+                          cond=cond)
         if self.norm is not None:
             x = self.norm(x)
 
@@ -2601,7 +2682,7 @@ class GeneTransformerRankPredictor(GeneTransformerBasePredictor):
         super().__init__(**base_predictor_kwargs)
 
         # Initialize positional embeddings
-        self.pos_embed = nn.Embedding(self.seq_len + 1, # include <pad>
+        self.pos_embed = nn.Embedding(self.n_positions + 1, # include <pad>
                                       self.predictor_embed_dim,
                                       padding_idx=0)
 
@@ -2611,7 +2692,7 @@ class GeneTransformerRankPredictor(GeneTransformerBasePredictor):
             pos_embed = get_1d_sincos_pos_embed(
                 embed_dim=self.predictor_embed_dim,
                 n_zero_pos=0,
-                n_sincos_pos=self.seq_len)
+                n_sincos_pos=self.n_positions)
             self.pos_embed.weight[1:].copy_(
                 torch.from_numpy(pos_embed).float())
 
@@ -2741,8 +2822,8 @@ class GeneTransformerRankPredictor(GeneTransformerBasePredictor):
 
             # Run forward prop
             for blk in self.predictor_blocks:
-                z = blk(z, masks=masks_attention,
-                        coords=pred_coords, cond=pred_cond)
+                z = run_block(self, blk, z, masks=masks_attention,
+                              coords=pred_coords, cond=pred_cond)
             z = self.predictor_norm(z)
 
             # Return predictions for (target) mask tokens
@@ -2895,8 +2976,8 @@ class GeneTransformerCountPredictor(GeneTransformerBasePredictor):
 
         # Run forward prop
         for blk in self.predictor_blocks:
-            z = blk(z, masks=masks_attention,
-                    coords=pred_coords, cond=pred_cond)
+            z = run_block(self, blk, z, masks=masks_attention,
+                          coords=pred_coords, cond=pred_cond)
         z = self.predictor_norm(z)
 
         # Return predictions for (target) mask tokens
@@ -2937,7 +3018,7 @@ class GeneTransformerCombinedPredictor(GeneTransformerBasePredictor):
 
         if self.predict_gene:
             # Initialize positional embeddings
-            self.pos_embed = nn.Embedding(self.seq_len + 1, # include <pad>
+            self.pos_embed = nn.Embedding(self.n_positions + 1, # include <pad>
                                           self.predictor_embed_dim,
                                           padding_idx=0)
             
@@ -2948,7 +3029,7 @@ class GeneTransformerCombinedPredictor(GeneTransformerBasePredictor):
                 pos_embed = get_1d_sincos_pos_embed(
                     embed_dim=self.predictor_embed_dim,
                     n_zero_pos=0,
-                    n_sincos_pos=self.seq_len)
+                    n_sincos_pos=self.n_positions)
                 self.pos_embed.weight[1:].copy_(
                     torch.from_numpy(pos_embed).float())
 
@@ -3095,8 +3176,8 @@ class GeneTransformerCombinedPredictor(GeneTransformerBasePredictor):
 
         # Run forward prop
         for blk in self.predictor_blocks:
-            z = blk(z, masks=masks_attention,
-                    coords=pred_coords, cond=pred_cond)
+            z = run_block(self, blk, z, masks=masks_attention,
+                          coords=pred_coords, cond=pred_cond)
         z = self.predictor_norm(z)
 
         # Return predictions for (target) mask tokens

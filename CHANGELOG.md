@@ -8,6 +8,71 @@ and this project adheres to [Semantic Versioning][].
 [keep a changelog]: https://keepachangelog.com/en/1.0.0/
 [semantic versioning]: https://semver.org/spec/v2.0.0.html
 
+## [Unreleased]
+
+### Added
+
+-   Fine-tuning, the count decoder and inference now run on **Apple Silicon
+    GPUs (MPS)** and **CPU** as well as NVIDIA GPUs. The device is picked
+    automatically (CUDA > MPS > CPU) by the new `terra.utils.get_device`, and
+    can be chosen explicitly: `device=` on `harmonize_tokenize_embed_pipeline`,
+    `embed_dataset` and `gene_embed_dataset`; `finetune.device` in fine-tuning
+    configs; `--device` / `device=` for `terra.training.decode` and
+    `apply_count_decoder`. `use_bfloat16` now enables bfloat16 autocast on MPS
+    as it does on CUDA. CPU runs stay in float32, as before. On MPS, attention
+    is computed in batch chunks when the attention-score matrix would exceed
+    MPS's 32-bit indexing limit (e.g. fine-tuning TERRA-96M at batch size 100).
+-   **Multi-stream alignment fine-tuning**: setting `data.streams` in the
+    `finetune_self_supervised` config trains on spatial cells with their
+    neighbours, the same cells without neighbours, and dissociated cells
+    (e.g. Tahoe-100M) in one run, with view-consistency and per-lineage
+    mean + CORAL alignment losses on whole-cell embeddings
+    (`terra.training.stream_objective`). Each stream logs `emb_std`, the
+    spread of its cell embeddings, to catch representation collapse. It can
+    switch to an asymmetric sequence layout (e.g. 2048 centre genes, 256 per
+    neighbour), train the embeddings of genes unseen in pretraining, use
+    gradient checkpointing and resume from a checkpoint. See
+    `configs/finetune/tahoe_alignment.yaml` and `docs/tahoe_alignment.md`.
+    Configs without `data.streams` run the existing loop unchanged.
+-   `embed_dataset`, `gene_embed_dataset` and `infer_token_distance` load
+    models whose config uses the asymmetric layout (`data.seq_len_neigh`,
+    `meta.n_positions`), e.g. those exported after multi-stream fine-tuning.
+    `embed_dataset(..., trim_padding=True)` skips trailing padding, which
+    speeds up embedding of cell-only records under a long layout.
+-   `terra.evaluation.alignment`: metrics for spatial / Tahoe-100M alignment
+    (domain mixing, paired-view similarity, per-drug separability and
+    cross-line consistency of drug shifts, cell-type retention, collapse
+    statistics) and `evaluate_alignment` to compute them all.
+
+### Changed
+
+-   `terra.training.decode --device` now accepts `auto` (default), `cpu`,
+    `mps`, `cuda` or `cuda:N`. Integer GPU ids still work, and `-1` now
+    reliably selects the CPU (it previously still picked CUDA when available).
+-   `DataLoader` memory pinning is applied only on CUDA, where it helps.
+-   `import terra.evaluation` no longer requires the `eval` extra; the
+    ligand-receptor helpers import `cellphonedb` / `omnipath` on first use.
+
+### Fixed
+
+-   `load_checkpoint(..., is_training=False)` now raises when the checkpoint
+    cannot be loaded. Previously inference and fine-tuning logged the error at
+    INFO level and silently continued with randomly initialized weights.
+-   Supervised fine-tuning (`terra.training.finetune`) now builds the encoder
+    with the same architecture options as inference (`mlp_bias`, `nz_spc` and
+    the `parse_arch_kwargs` options). It previously built a model without the
+    `value_embed` biases present in the pretrained checkpoints (e.g.
+    TERRA-96M). The pretrained weights then failed to load, and because of the
+    silent fallback above, fine-tuning started from random initialization.
+-   The `laplacian` cell positional encoding falls back to CPU for the
+    eigendecomposition on backends without `torch.linalg.eigh` (MPS before
+    PyTorch 2.10).
+-   `prepare_finetuned_model(..., use_peft=True)` now applies the LoRA scale
+    (`peft_alpha / peft_rank`, read from the run's `params.yaml`) when merging
+    the adapters. The exported `encoder` and `predictor` previously omitted
+    it (e.g. a 16x too small update with the tutorial's rank 16, alpha 256).
+    The `target_encoder`, which embedding uses, was not affected.
+
 ## [0.1.13] - 2026-07-28
 
 ### Fixed

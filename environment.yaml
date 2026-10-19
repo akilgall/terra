@@ -1,3 +1,5 @@
+# Linux / NVIDIA CUDA environment. On macOS (Apple Silicon / MPS) or CPU-only
+# machines, install PyTorch and TERRA with pip/uv instead (see README.md).
 name: terra
 channels:
   - pytorch

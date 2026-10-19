@@ -20,6 +20,7 @@ from tqdm import tqdm
 from pyensembl import EnsemblRelease
 from scipy.sparse import issparse
 
+from terra.utils.device import autocast, get_device, should_pin_memory
 from terra.utils.helper import (init_model, load_checkpoint, parse_arch_kwargs,
                        parse_protein_init_kwargs)
 from terra.datasets.cell_datasets import CellBaseDataset, init_cell_dataset
@@ -140,12 +141,8 @@ def infer(args: dict,
     adata : anndata.AnnData
         An AnnData object with the stored embeddings and labels.
     """
-    # Set device
-    if not torch.cuda.is_available():
-        device = torch.device('cpu')
-    else:
-        device = torch.device('cuda:0')
-        torch.cuda.set_device(device)
+    # Set device (CUDA > MPS > CPU)
+    device = get_device()
 
     # Load params from config file
     add_cls = args['meta']['add_cls']
@@ -200,7 +197,7 @@ def infer(args: dict,
     token_dict_folder_path = args['data']['token_dict_folder_path']
     raw_data_folder_path = args['data']['raw_data_folder_path']
     batch_size = args['data']['batch_size']
-    pin_memory = args['data']['pin_memory']
+    pin_memory = should_pin_memory(device, args['data']['pin_memory'])
     num_workers = args['data']['num_workers']
     tokenizer_type = args['data']['tokenizer_type']
     seq_len_cell = args['data']['seq_len_cell']
@@ -446,8 +443,7 @@ def infer(args: dict,
             masks_attention[mask_indices] = 0
 
         # Retrieve gene embeddings from different layers
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16,
-                                     enabled=args['meta']['use_bfloat16']):
+        with autocast(device, args['meta']['use_bfloat16']):
 
             full_ctx, cell_only_ctx = return_layer_emb_fn(
                 layers=emb_layers,

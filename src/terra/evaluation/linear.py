@@ -15,6 +15,8 @@ from sklearn.metrics import (classification_report,
                              mean_absolute_error,
                              mean_squared_error)
 
+from terra.utils.device import get_device
+
 
 logger = logging.getLogger(__name__)
 
@@ -91,8 +93,7 @@ def linear_classifier(
         features_eval, labels_eval = features_val, labels_val
 
     # --- Device setup ---
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
+    device = get_device()
 
     features_train = torch.tensor(features_train, dtype=torch.float32)
     labels_train = torch.tensor(labels_train, dtype=torch.long)
@@ -253,8 +254,7 @@ def linear_regressor(
     """
 
     # --- Device setup ---
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
+    device = get_device()
 
     features_train = torch.tensor(features_train, dtype=torch.float32)
     labels_train = torch.tensor(labels_train, dtype=torch.float32)

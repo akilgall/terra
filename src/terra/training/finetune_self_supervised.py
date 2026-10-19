@@ -15,6 +15,9 @@ Checkpoints are written as ``checkpoint_epoch_<N>.pt`` holding the ``encoder``,
 ``predictor`` and ``target_encoder`` state dicts. Use
 :func:`prepare_finetuned_model` (also in this module) to merge the LoRA adapters
 and assemble a self-contained, embeddable model folder.
+
+When ``args['data']['streams']`` is set, training dispatches to the
+multi-stream alignment loop in :mod:`terra.training.multistream_finetune`.
 """
 
 import copy
@@ -29,39 +32,48 @@ import torch
 import torch.nn.functional as F
 import yaml
 from datasets import Dataset, concatenate_datasets, load_from_disk
-from peft import LoraConfig, get_peft_model
 from tqdm import tqdm
 
 from terra.datasets.cell_datasets import init_cell_dataset
 from terra.datasets.dataloaders import init_dataloader_and_sampler
 from terra.masks.block_masking import BlockMaskCollator
 from terra.masks.utils import apply_masks
+from terra.training.lora import apply_lora as _apply_lora
+from terra.training.lora import lora_scale_from_config, merge_lora_weights
+from terra.training.multistream import parse_streams
+from terra.training.multistream_finetune import finetune_multistream
+from terra.utils.device import autocast, get_device, should_pin_memory
 from terra.utils.helper import init_model, init_opt
 
 logger = logging.getLogger(__name__)
 
+__all__ = ["finetune_self_supervised", "merge_lora_weights", "prepare_finetuned_model"]
+
 _GLOBAL_SEED = 0
 
 
-def _apply_lora(model,
-                peft_rank=16,
-                peft_alpha=256,
-                peft_dropout=0.1,
-                peft_bias='none',
-                peft_target_modules=None):
-    """Wrap ``model`` with LoRA adapters and freeze everything else."""
-    if peft_target_modules is None:
-        peft_target_modules = ['qkv', 'proj', 'fc1', 'fc2']
-    peft_config = LoraConfig(r=peft_rank,
-                             lora_alpha=peft_alpha,
-                             lora_dropout=peft_dropout,
-                             bias=peft_bias,
-                             task_type=None,
-                             target_modules=peft_target_modules)
-    peft_model = get_peft_model(model, peft_config)
-    for name, p in peft_model.named_parameters():   # train only the adapters
-        p.requires_grad = ('lora_' in name.lower())
-    return peft_model
+def _make_run_dir(args: dict,
+                  save_folder_path: str | None,
+                  run_name: str | None,
+                  ) -> Path:
+    """Create the run directory and write the fine-tune args to it."""
+    if not save_folder_path:
+        finetune_checkpoint_path = Path(args['model']['finetune_checkpoint_path'])
+    else:
+        finetune_checkpoint_path = Path(save_folder_path)
+
+    if run_name:
+        finetune_dir = finetune_checkpoint_path / run_name
+    else:
+        current_timestamp = (
+            datetime.now().strftime("%d%m%Y_%H%M%S") +
+            f"_{datetime.now().microsecond // 1000:03d}")
+        finetune_dir = finetune_checkpoint_path / current_timestamp
+    finetune_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(finetune_dir / 'params.yaml', 'w') as f:
+        yaml.dump(args, f)
+    return finetune_dir
 
 
 def _load_pretrained_checkpoint(device, r_path, encoder, predictor,
@@ -120,12 +132,16 @@ def finetune_self_supervised(
         sections (see ``configs`` / the tutorial's ``config_Visium_IJEPA.yaml``
         for the schema). ``args['model']['pretrained_checkpoint_path']`` must
         point at a model folder containing ``model_config.yaml``,
-        ``token_dictionary.pkl`` and ``model_checkpoint.pt``.
+        ``token_dictionary.pkl`` and ``model_checkpoint.pt``. The optional
+        ``args['finetune']['device']`` selects ``'auto'`` (default: CUDA >
+        MPS > CPU), ``'cpu'``, ``'mps'`` or ``'cuda:N'``. If
+        ``args['data']['streams']`` is set, the multi-stream alignment loop
+        runs instead (see ``configs/finetune/tahoe_alignment.yaml``).
     dataset:
         Tokenised HuggingFace :class:`~datasets.Dataset` to fine-tune on. If
         ``None``, the tokenised sections listed in
         ``args['data']['finetune_dataset']`` are loaded, concatenated and
-        shuffled automatically.
+        shuffled automatically. Not supported with ``data.streams``.
     save_folder_path:
         Directory for checkpoints. Defaults to
         ``args['model']['finetune_checkpoint_path']``.
@@ -165,13 +181,20 @@ def finetune_self_supervised(
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
 
-    if not torch.cuda.is_available():
-        device = torch.device('cpu')
-    elif LOCAL_RANK is not None:
-        device = torch.device(f"cuda:{LOCAL_RANK}")
-    else:
-        device = torch.device('cuda:0')
-        torch.cuda.set_device(device)
+    device = get_device(args['finetune'].get('device'), LOCAL_RANK)
+
+    # -- Multi-stream alignment fine-tuning -----------------------------------
+    streams = parse_streams(args)
+    if streams is not None:
+        if dataset is not None:
+            raise ValueError("Pass datasets through data.streams, not the "
+                             "`dataset` argument, for multi-stream fine-tuning.")
+        run_dir = finetune_multistream(
+            args, streams, device, _make_run_dir(args, save_folder_path, run_name),
+            log_fn=_wandb.log if use_wandb else None)
+        if _owns_wandb:
+            _wandb.finish()
+        return run_dir
 
     # -- Load the tokenised dataset if not provided ---------------------------
     if dataset is None:
@@ -231,29 +254,14 @@ def finetune_self_supervised(
         world_size=1,
         rank=0,
         collate_fn=mask_collator,
-        pin_memory=args['data']['pin_memory'],
+        pin_memory=should_pin_memory(device, args['data']['pin_memory']),
         num_workers=args['data']['num_workers'],
         drop_last=args['data'].get('drop_last', True),
         persistent_workers=False,
         mega_batch_mult_max=1000)
 
     # -- Checkpoint directory -------------------------------------------------
-    if not save_folder_path:
-        finetune_checkpoint_path = Path(args['model']['finetune_checkpoint_path'])
-    else:
-        finetune_checkpoint_path = Path(save_folder_path)
-
-    if run_name:
-        finetune_dir = finetune_checkpoint_path / run_name
-    else:
-        current_timestamp = (
-            datetime.now().strftime("%d%m%Y_%H%M%S") +
-            f"_{datetime.now().microsecond // 1000:03d}")
-        finetune_dir = finetune_checkpoint_path / current_timestamp
-    finetune_dir.mkdir(parents=True, exist_ok=True)
-
-    with open(finetune_dir / 'params.yaml', 'w') as f:
-        yaml.dump(args, f)
+    finetune_dir = _make_run_dir(args, save_folder_path, run_name)
 
     # -- Initialize encoder, predictor and target encoder ---------------------
     logger.info("Initializing encoder, predictor, and target encoder...")
@@ -443,7 +451,7 @@ def finetune_self_supervised(
             _new_lr = lr_schedule.step()
             _new_wd = wd_schedule.step()
 
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_bfloat16):
+            with autocast(device, use_bfloat16):
                 # Target encoder forward pass
                 with torch.no_grad():
                     h, _ = target_encoder(batch=udata, masks_attention=masks_attention)
@@ -551,41 +559,15 @@ def finetune_self_supervised(
 
 # Adapter merge / model preparation
 
-def merge_lora_weights(state_dict: dict) -> dict:
-    """Fold LoRA adapters in a PEFT state dict into the base weights.
-
-    For each adapted layer, ``W = W_base + (lora_B @ lora_A)``; layers without
-    adapters are copied unchanged. The ``base_model.model.`` / ``base_layer``
-    PEFT wrapper prefixes are stripped so the result matches the plain model's
-    parameter names.
-    """
-    base_weights, lora_a_weights, lora_b_weights = {}, {}, {}
-    for key, value in state_dict.items():
-        if 'base_layer.weight' in key or 'base_layer.bias' in key:
-            clean_key = key.replace('base_model.model.', '').replace('.base_layer', '')
-            base_weights[clean_key] = value
-        elif 'lora_A.default.weight' in key:
-            clean_key = key.replace('base_model.model.', '').replace('.lora_A.default.weight', '.weight')
-            lora_a_weights[clean_key] = value
-        elif 'lora_B.default.weight' in key:
-            clean_key = key.replace('base_model.model.', '').replace('.lora_B.default.weight', '.weight')
-            lora_b_weights[clean_key] = value
-        elif 'base_model.model.' in key:
-            clean_key = key.replace('base_model.model.', '')
-            base_weights[clean_key] = value
-
-    merged_weights = {}
-    n_merged = 0
-    for key, base_weight in base_weights.items():
-        if key in lora_a_weights and key in lora_b_weights:
-            delta = torch.mm(lora_b_weights[key], lora_a_weights[key])
-            merged_weights[key] = base_weight + delta
-            n_merged += 1
-        else:
-            merged_weights[key] = base_weight
-    logger.info("Merged %d LoRA adapter layers (%d total layers)",
-                n_merged, len(merged_weights))
-    return merged_weights
+def _run_lora_scaling(finetuned_checkpoint_dir: Path) -> float:
+    """LoRA scale ``alpha / rank`` from the run's ``params.yaml``."""
+    params_file = finetuned_checkpoint_dir / 'params.yaml'
+    if not params_file.exists():
+        raise FileNotFoundError(
+            f"{params_file} not found; pass lora_scaling (peft_alpha / "
+            "peft_rank) explicitly to merge the LoRA adapters.")
+    with open(params_file) as f:
+        return lora_scale_from_config(yaml.safe_load(f)["finetune"])
 
 
 def prepare_finetuned_model(
@@ -594,10 +576,13 @@ def prepare_finetuned_model(
         output_dir: str,
         checkpoint_epoch: int | None = None,
         use_peft: bool = False,
+        lora_scaling: float | None = None,
     ) -> str:
     """Assemble an embeddable model folder from a fine-tuning checkpoint.
 
-    Copies ``model_config.yaml``, ``token_dictionary.pkl`` and the
+    Copies ``model_config.yaml`` (the run directory's own copy when present,
+    e.g. after a multi-stream fine-tune changed the sequence layout, else the
+    pretrained one), ``token_dictionary.pkl`` and the
     gene-reference files from the pretrained model, loads a checkpoint written
     by :func:`finetune_self_supervised`, optionally merges its LoRA adapters
     into the base weights, and writes a self-contained model folder
@@ -622,6 +607,9 @@ def prepare_finetuned_model(
         Set ``True`` if the fine-tune used LoRA, to merge the adapters into the
         base encoder/predictor weights. The target encoder (used for embedding)
         already holds fully EMA-merged weights and is copied as-is.
+    lora_scaling:
+        LoRA scale ``peft_alpha / peft_rank`` used for the merge. Defaults to
+        the value in the run's ``params.yaml``.
 
     Returns
     -------
@@ -633,8 +621,11 @@ def prepare_finetuned_model(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Config + vocabulary come from the pretrained model unchanged
-    shutil.copy2(pretrained_model_dir / 'model_config.yaml',
+    # The run's config records a changed sequence layout; the vocabulary
+    # comes from the pretrained model unchanged
+    run_config = finetuned_checkpoint_dir / 'model_config.yaml'
+    shutil.copy2(run_config if run_config.exists()
+                 else pretrained_model_dir / 'model_config.yaml',
                  output_dir / 'model_config.yaml')
     shutil.copy2(pretrained_model_dir / 'token_dictionary.pkl',
                  output_dir / 'token_dictionary.pkl')
@@ -669,9 +660,12 @@ def prepare_finetuned_model(
     target_encoder_state_dict = checkpoint['target_encoder']
 
     if use_peft:
-        logger.info("Merging LoRA adapters into the base model...")
-        encoder_state_dict = merge_lora_weights(encoder_state_dict)
-        predictor_state_dict = merge_lora_weights(predictor_state_dict)
+        if lora_scaling is None:
+            lora_scaling = _run_lora_scaling(finetuned_checkpoint_dir)
+        logger.info("Merging LoRA adapters into the base model (scale %s)...",
+                    lora_scaling)
+        encoder_state_dict = merge_lora_weights(encoder_state_dict, lora_scaling)
+        predictor_state_dict = merge_lora_weights(predictor_state_dict, lora_scaling)
         # target_encoder already holds merged fine-tuned weights from the EMA
 
     model_checkpoint = {

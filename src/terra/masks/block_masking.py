@@ -11,6 +11,8 @@ import logging
 import numpy as np
 import torch
 
+from terra.datasets.segment_layout import SegmentLayout
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,6 +45,10 @@ class BlockMaskCollator:
     sample_gene_masks:
         If `True`, sample a gene mask for each cell. Should be used
         during training but not inference.
+    seq_len_neigh:
+        Gene-token slots per neighbour for the asymmetric layout (centre
+        `seq_len_cell`, neighbours `seq_len_neigh`). `None` keeps the legacy
+        uniform layout.
     """
     def __init__(self,
                  n_targets: int,
@@ -56,7 +62,8 @@ class BlockMaskCollator:
                  cell_segment_sampling_ratio: float = 0.09090909090909091,
                  special_token_pad_ratio: float = 0.,
                  sample_gene_masks: bool = True,
-                 restrict_special_attention: bool = False):
+                 restrict_special_attention: bool = False,
+                 seq_len_neigh: int | None = None):
         self.n_targets = n_targets
         self.n_contexts = n_contexts
         self.n_segments = n_segments
@@ -70,6 +77,98 @@ class BlockMaskCollator:
         self.restrict_special_attention = restrict_special_attention
         self.cell_segment_sampling_ratio = cell_segment_sampling_ratio
         self.special_token_pad_ratio = special_token_pad_ratio
+        self.layout = (
+            SegmentLayout.from_lengths(
+                seq_len_cell, seq_len_neighborhood,
+                seq_len_neigh=seq_len_neigh,
+                n_special_tokens=n_special_tokens)
+            if seq_len_neigh is not None else None)
+
+    def segment_cutoff(self, k: int) -> int:
+        """Sequence index after the first `k` segments (incl. specials)."""
+        if self.layout is not None:
+            return self.layout.cutoff(k)
+        return self.n_special_tokens + (self.seq_len_cell * k)
+
+    @staticmethod
+    def zero_beyond(collated: dict, cutoff: int) -> None:
+        """Pad (in place) every per-token field from `cutoff` onwards."""
+        if 'tokens' in collated:
+            collated['tokens'][:, cutoff:] = 0
+        if 'segments' in collated:
+            collated['segments'][:, cutoff:] = 0
+        if 'positions' in collated:
+            collated['positions'][:, cutoff:] = 0
+        if 'values' in collated:
+            collated['values'][:, cutoff:] = 0.0
+        if 'rel_x_coords' in collated:
+            collated['rel_x_coords'][:, cutoff:] = float('-inf')
+        if 'rel_y_coords' in collated:
+            collated['rel_y_coords'][:, cutoff:] = float('-inf')
+
+    @staticmethod
+    def stack_min_trimmed(
+            tgt_list: list[list[torch.Tensor]],
+            ctx_list: list[list[torch.Tensor]],
+            seq_len_genes: int,
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Trim per-cell target/context masks to the shortest mask in the batch
+        and stack them as [n_masks, B, keep].
+        """
+        keep_tgt = seq_len_genes
+        keep_ctx = seq_len_genes
+        for tgt, ctx in zip(tgt_list, ctx_list):
+            # Track min lengths (avoid nested default_collate later)
+            if len(tgt):
+                keep_tgt = min(keep_tgt, min(m.numel() for m in tgt))
+            if len(ctx):
+                keep_ctx = min(keep_ctx, min(m.numel() for m in ctx))
+
+        # Trim to min length and stack directly (faster than
+        # default_collate on nested lists)
+        tgt_trimmed = [
+            torch.stack([m[:keep_tgt].to(torch.long) for m in masks], dim=0
+                ) for masks in tgt_list]
+        collated_target_masks = torch.stack(
+            tgt_trimmed, dim=0) # [B, n_tgt, keep_tgt]
+        collated_target_masks = collated_target_masks.permute(
+            1, 0, 2).contiguous() # [n_tgt, B, keep_tgt]
+
+        ctx_trimmed = [
+            torch.stack([m[:keep_ctx].to(torch.long) for m in masks], dim=0
+                ) for masks in ctx_list]
+        collated_context_masks = torch.stack(
+            ctx_trimmed, dim=0) # [B, n_ctx, keep_ctx]
+        collated_context_masks = collated_context_masks.permute(
+            1, 0, 2).contiguous()  # [n_ctx, B, keep_ctx]
+        return collated_target_masks, collated_context_masks
+
+    def sample_masks_for_tokens(
+            self,
+            tokens: torch.Tensor,
+            pad_special_tokens: bool = False,
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Sample block masks for a collated token batch [B, N].
+
+        Returns
+        ----------
+        collated_context_masks: LongTensor [n_ctx, B, Lctx] (min-trimmed)
+        collated_target_masks: LongTensor [n_tgt, B, Ltgt] (min-trimmed)
+        """
+        # Retrieve target and context masks per cell
+        tgt_list: list[list[torch.Tensor]] = []
+        ctx_list: list[list[torch.Tensor]] = []
+        for i in range(tokens.shape[0]):
+            tgt, ctx = self._sample_gene_mask(
+                tokens=tokens[i],
+                pad_special_tokens=pad_special_tokens)
+            tgt_list.append(tgt)
+            ctx_list.append(ctx)
+        collated_target_masks, collated_context_masks = \
+            self.stack_min_trimmed(tgt_list, ctx_list, self.seq_len_genes)
+        return collated_context_masks, collated_target_masks
 
     def _sample_gene_mask(
         self,
@@ -204,21 +303,10 @@ class BlockMaskCollator:
             else:
                 k = torch.randint(
                     low=2, high=self.n_segments + 1, size=(1,)).item()
-            cutoff = self.n_special_tokens + (self.seq_len_cell * k)
+            cutoff = self.segment_cutoff(k)
 
             # Pad all segments not kept in cell graph
-            if 'tokens' in collated:
-                collated['tokens'][:, cutoff:] = 0
-            if 'segments' in collated:
-                collated['segments'][:, cutoff:] = 0
-            if 'positions' in collated:
-                collated['positions'][:, cutoff:] = 0
-            if 'values' in collated:
-                collated['values'][:, cutoff:] = 0.0
-            if 'rel_x_coords' in collated:
-                collated['rel_x_coords'][:, cutoff:] = float('-inf')
-            if 'rel_y_coords' in collated:
-                collated['rel_y_coords'][:, cutoff:] = float('-inf')
+            self.zero_beyond(collated, cutoff)
 
         if self.n_special_tokens > 0:
             pad_special_tokens = torch.rand(
@@ -271,41 +359,9 @@ class BlockMaskCollator:
                     (i+1):] = 0
 
         if self.sample_gene_masks:
-            # Retrieve target and context masks per cell
-            tgt_list: list[list[torch.Tensor]] = []
-            ctx_list: list[list[torch.Tensor]] = []
-            keep_tgt = self.seq_len_genes
-            keep_ctx = self.seq_len_genes
-
-            for i in range(B):
-                tgt, ctx = self._sample_gene_mask(
-                    tokens=tokens[i],
-                    pad_special_tokens=pad_special_tokens)
-                # Track min lengths (avoid nested default_collate later)
-                if len(tgt):
-                    keep_tgt = min(keep_tgt, min(m.numel() for m in tgt))
-                if len(ctx):
-                    keep_ctx = min(keep_ctx, min(m.numel() for m in ctx))
-                tgt_list.append(tgt)
-                ctx_list.append(ctx)
-
-            # Trim to min length and stack directly (faster than
-            # default_collate on nested lists)
-            tgt_trimmed = [
-                torch.stack([m[:keep_tgt].to(torch.long) for m in masks], dim=0
-                    ) for masks in tgt_list]
-            collated_target_masks = torch.stack(
-                tgt_trimmed, dim=0) # [B, n_tgt, keep_tgt]
-            collated_target_masks = collated_target_masks.permute(
-                1, 0, 2).contiguous() # [n_tgt, B, keep_tgt]
-
-            ctx_trimmed = [
-                torch.stack([m[:keep_ctx].to(torch.long) for m in masks], dim=0
-                    ) for masks in ctx_list]
-            collated_context_masks = torch.stack(
-                ctx_trimmed, dim=0) # [B, n_ctx, keep_ctx]
-            collated_context_masks = collated_context_masks.permute(
-                1, 0, 2).contiguous()  # [n_ctx, B, keep_ctx]
+            collated_context_masks, collated_target_masks = \
+                self.sample_masks_for_tokens(
+                    tokens, pad_special_tokens=pad_special_tokens)
         else:
             collated_target_masks = None
             collated_context_masks = None

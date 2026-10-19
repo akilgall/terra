@@ -210,7 +210,8 @@ def create_binary_selection_mask(ns_tokens: torch.Tensor,
                                  excluded_tokens: list[int] | None = None,
                                  top_k: int | None = None,
                                  n_segments: int | None = None,
-                                 gene_id: int | None = None
+                                 gene_id: int | None = None,
+                                 seq_len_neigh: int | None = None,
                                  ) -> torch.Tensor:
     """
     Create a selection mask for cell and neighborhood tokens based on
@@ -235,6 +236,11 @@ def create_binary_selection_mask(ns_tokens: torch.Tensor,
         The ID of the gene for which the embedding is retrieved. Only
         relevant if `selection_type` is `gene_cell` or
         `gene_neighborhood`.
+    seq_len_neigh:
+        Slots per neighbour segment for the asymmetric layout (centre
+        `seq_len_cell`, neighbours `seq_len_neigh`). Only changes the
+        per-segment `top_k` cut of `agg_graph`. `None` assumes every segment
+        has `seq_len_cell` slots.
 
     Returns
     -----------
@@ -279,7 +285,15 @@ def create_binary_selection_mask(ns_tokens: torch.Tensor,
             selection_mask[torch.isin(
                 ns_tokens,
                 torch.tensor(excluded_tokens).to(ns_tokens.device))] = False
-        if top_k:
+        if top_k and seq_len_neigh is not None:
+            # Asymmetric layout: centre [0, seq_len_cell), then neighbours
+            # of seq_len_neigh slots each.
+            selection_mask[:, top_k:seq_len_cell] = False
+            for i in range(n_segments - 1):
+                start = seq_len_cell + i * seq_len_neigh
+                selection_mask[
+                    :, start + top_k:start + seq_len_neigh] = False
+        elif top_k:
             # Exclude tokens beyond the top_k positions in all segments
             for i in range(n_segments - 1):
                 selection_mask[

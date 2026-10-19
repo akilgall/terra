@@ -1,0 +1,111 @@
+# Multi-stream alignment fine-tuning of TERRA-96M on whole-transcriptome
+# spatial data (CosMx NSCLC) together with Tahoe-100M.
+#
+#   python -c "import yaml; from terra.training.finetune_self_supervised import \
+#       finetune_self_supervised; finetune_self_supervised(yaml.safe_load( \
+#       open('configs/finetune/tahoe_alignment.yaml')), run_name='tahoe_align')"
+#
+# Datasets are tokenized with the layout below (2048 centre genes, 10
+# neighbours x 256 genes) and carry label columns from
+#   python -m terra.tahoe.prepare tahoe   ...   (Tahoe slice -> tahoe_ds)
+#   python -m terra.tahoe.prepare spatial ...   (spatial dataset + labels)
+# Export for embedding with prepare_finetuned_model(run_dir, <bundle>, <out>,
+# use_peft=True); the exported model_config.yaml keeps this layout.
+
+model:
+  pretrained_checkpoint_path: /path/to/TERRA-96M          # HF snapshot folder
+  finetune_checkpoint_path: runs/tahoe_alignment
+
+data:
+  # Sequence layout (overrides the pretrained 11 x 256): centre cell K genes,
+  # every neighbour seq_len_neigh genes. Positions restart in each segment,
+  # so the pretrained position table (2816 rows) covers K <= 2816.
+  seq_len_cell: 2048
+  seq_len_neigh: 256
+  # Stored strides of the tokenized datasets (load-time truncation); a
+  # stream can override them, e.g. Tahoe records are centre-only.
+  tokenized_seq_len_cell: 2048
+  tokenized_seq_len_neigh: 256
+  batch_size: 16                 # default per stream
+  epoch_batches: null            # optimizer steps per epoch; null = all batches
+  length_grouped: true           # similar gene counts share a batch
+  trim_trailing_pad: true        # cut cell-only views to the last real token
+  num_workers: 2                 # macOS: keep small (spawn start method)
+  pin_memory: true               # CUDA only; ignored elsewhere
+  streams:
+    # Steps per epoch are split between streams by weight (1/3 each here).
+    spatial:                     # cells with their neighbours: JEPA
+      kind: spatial_full
+      paths: [/path/to/spatial_labeled/spatial_ds]
+      weight: 1.0
+    spatial_cell:                # same cells, neighbours hidden
+      kind: spatial_cell_only
+      paths: [/path/to/spatial_labeled/spatial_ds]
+      weight: 1.0
+    tahoe:                       # Tahoe-100M cells (no coordinates)
+      kind: cell_only
+      paths: [/path/to/tahoe_slice/tahoe_ds]
+      weight: 1.0
+      batch_size: 64             # short trimmed rows -> larger batches fit
+
+finetune:
+  device: auto                   # auto | cpu | mps | cuda:N
+  num_epochs: 10
+  # 1e-3 (the Xenium notebook value) collapsed the online encoder within 60
+  # steps in tests with this LoRA scale (alpha / rank = 16), with or without
+  # warmup; watch <stream>/emb_std in the logs.
+  lr: 1.0e-04
+  start_lr: 1.0e-05
+  final_lr: 1.0e-05
+  warmup_epochs: 1
+  weight_decay: 0.04
+  final_weight_decay: 0.4
+  ema_momentum: 0.9995
+  final_ema_momentum: 1.0
+  loss_fn_type: smooth_l1
+  clip_grad: 2.0
+  use_bfloat16: true
+  save_every: 1
+  resume_from: null              # path to a checkpoint_epoch_<N>.pt of this run
+
+  # LoRA adapters on attention and MLP projections
+  use_peft: true
+  peft_method: lora
+  peft_rank: 16
+  peft_alpha: 256
+  peft_dropout: 0.0              # must be 0 with grad_checkpointing on MPS
+  peft_bias: none
+  peft_target_modules: [qkv, proj, fc1, fc2]
+
+  # Activation memory: recompute each block in the backward pass
+  grad_checkpointing: true
+
+  # Train the token embeddings of genes never seen in pretraining (random
+  # rows in TERRA-96M); pretrained rows stay fixed. Own optimizer group
+  # without weight decay and with token_embed_lr_mult x the learning rate.
+  extra_trainable: [token_embed]
+  token_embed_rows: unseen       # unseen | all
+  token_embed_lr_mult: 5.0
+
+  multistream:
+    # Each term: weight, start_epoch, ramp_epochs (linear ramp to weight).
+    cell_only_jepa:              # JEPA weight for the two cell-only streams
+      weight: 1.0
+    view_consistency:            # cell-only view -> full-view embedding
+      weight: 1.0
+      start_epoch: 1
+      ramp_epochs: 1
+    alignment:                   # Tahoe controls -> spatial cells, per lineage
+      weight: 1.0
+      start_epoch: 2
+      ramp_epochs: 1
+      key: lineage_value
+      control_only: true         # only DMSO controls are aligned
+      control_key: is_control_value
+      min_cells: 16              # per lineage, in the batch and in the bank
+      bank_size: 1024            # spatial embeddings kept per lineage
+      lambda_mean: 1.0           # mean matching alongside CORAL
+    variance:                    # anti-collapse hinge on cell-only streams
+      weight: 0.1
+      gamma: 0.2                 # per-dim std floor, ~the pretrained spread;
+                                 # 1.0 inflates the Tahoe embeddings

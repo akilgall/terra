@@ -86,5 +86,30 @@ class TestCreateBinarySelectionMask(unittest.TestCase):
         print(computed_mask)
         self.assertTrue(torch.equal(expected_mask, computed_mask))
 
+    def test_top_k_graph_uniform_layout(self):
+        tokens = torch.arange(1, 13).unsqueeze(0)  # [4][4][4]
+        expected_mask = torch.tensor(
+            [[1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0]], dtype=torch.bool)
+        computed_mask = create_binary_selection_mask(
+            ns_tokens=tokens,
+            seq_len_cell=4,
+            selection_type='agg_graph',
+            top_k=2,
+            n_segments=3)
+        self.assertTrue(torch.equal(expected_mask, computed_mask))
+
+    def test_top_k_graph_asymmetric_layout(self):
+        tokens = torch.arange(1, 13).unsqueeze(0)  # [6][3][3]
+        expected_mask = torch.tensor(
+            [[1, 1, 0, 0, 0, 0, 1, 1, 0, 1, 1, 0]], dtype=torch.bool)
+        computed_mask = create_binary_selection_mask(
+            ns_tokens=tokens,
+            seq_len_cell=6,
+            selection_type='agg_graph',
+            top_k=2,
+            n_segments=3,
+            seq_len_neigh=3)
+        self.assertTrue(torch.equal(expected_mask, computed_mask))
+
 if __name__ == '__main__':
     unittest.main()

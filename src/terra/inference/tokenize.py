@@ -42,6 +42,32 @@ from typing import Dict, List
 logger = logging.getLogger(__name__)
 
 
+def _cell_graph_layout_kwargs(data_config: dict,
+                              adata: ad.AnnData,
+                              cell_only: bool | None,
+                              ) -> dict:
+    """
+    Tokenizer layout kwargs for the cell-graph tokenizer.
+
+    Asymmetric budgets come from `data.seq_len_neigh` in the model config;
+    cell-only mode from the explicit argument, else `data.cell_only`, else
+    the absence of spatial coordinates. Returns `{}` for the legacy layout.
+    """
+    if cell_only is None:
+        cell_only = bool(data_config.get('cell_only', False)) or \
+            'spatial' not in adata.obsm
+        if cell_only and 'spatial' not in adata.obsm:
+            logger.info("No adata.obsm['spatial']: tokenizing cell-only records.")
+    kwargs = {}
+    if data_config.get('seq_len_neigh') is not None:
+        kwargs['seq_len_cell'] = data_config['seq_len_cell']
+        kwargs['seq_len_neigh'] = data_config['seq_len_neigh']
+    if cell_only:
+        kwargs['cell_only'] = True
+        kwargs.setdefault('seq_len_cell', data_config['seq_len_cell'])
+    return kwargs
+
+
 def tokenize_adata(adata: ad.AnnData,
                    model_folder_path: str,
                    cache_directory_path: str,             
@@ -52,6 +78,8 @@ def tokenize_adata(adata: ad.AnnData,
                    use_generator: bool = True,
                    keep_in_memory: bool = False,
                    include_special_tokens: bool = False,
+                   cell_only: bool | None = None,
+                   data_overrides: dict | None = None,
                    ) -> Dataset:
     """
     Tokenize an AnnData object based on the parameters in the model config and
@@ -79,6 +107,15 @@ def tokenize_adata(adata: ad.AnnData,
         Whether to keep dataset in memory.
     include_special_tokens:
         Whether to include special tokens in the tokenized output.
+    cell_only:
+        Tokenize cells without spatial neighbours (e.g. dissociated
+        single-cell data). `None` uses `data.cell_only` from the model config,
+        or `True` when `adata.obsm` has no `'spatial'` coordinates. Only
+        supported for the `cell_graph` tokenizer.
+    data_overrides:
+        Keys overriding the model config's `data` section for tokenization
+        (e.g. `{'seq_len_cell': 2048, 'seq_len_neigh': 256,
+        'model_input_size': 4608}` for the asymmetric layout).
 
     Returns
     -----------
@@ -92,14 +129,15 @@ def tokenize_adata(adata: ad.AnnData,
     # Load model config
     with open(model_config_file_path, 'r') as file:
         model_config = yaml.safe_load(file)
+    data_config = {**model_config['data'], **(data_overrides or {})}
 
     # Normalization-artifact paths are read FROM THE MODEL CONFIG (recorded at
     # training time under config['data']). If a path is specified, it is used
     # and logged; if it is absent, it is not read and a warning notes the
     # per-file fallback. This keeps the inference normalization explicit and
     # matched to how the model was trained -- no silent mismatch.
-    norm_factor_file_path = model_config['data'].get('norm_factor_file_path')
-    pf_targets_file_path = model_config['data'].get('pf_targets_file_path')
+    norm_factor_file_path = data_config.get('norm_factor_file_path')
+    pf_targets_file_path = data_config.get('pf_targets_file_path')
 
     if norm_factor_file_path:
         logger.info("Gene norm factors: reading from config path "
@@ -120,28 +158,32 @@ def tokenize_adata(adata: ad.AnnData,
 
     logger.info('STEP 2: TOKENIZING ANNDATA OBJECT...')
     # Tokenize adata
-    if model_config['data']['tokenizer_type'] == 'cell_neigh':
+    layout_kwargs = {}
+    if data_config['tokenizer_type'] == 'cell_neigh':
         Tokenizer = cell_tokenizers.CellNeighborhoodTokenizer
-    elif model_config['data']['tokenizer_type'] == 'cell_graph':
+    elif data_config['tokenizer_type'] == 'cell_graph':
         Tokenizer = cell_tokenizers.CellGraphTokenizer
+        layout_kwargs = _cell_graph_layout_kwargs(
+            data_config, adata, cell_only)
     tk = Tokenizer(
         nproc=nproc,
         processing_mode=processing_mode,
-        model_input_size=model_config['data']['model_input_size'],
-        n_neighs=model_config['data']['n_neighs'],
+        model_input_size=data_config['model_input_size'],
+        n_neighs=data_config['n_neighs'],
         radius=None,
         delaunay=False,
-        rank_cell_norm_method=model_config['data']['rank_cell_norm_method'],
-        rank_gene_norm_method=model_config['data']['rank_gene_norm_method'],
-        rank_count_norm_method=model_config['data']['rank_count_norm_method'],
-        count_cell_norm_method=model_config['data']['count_cell_norm_method'],
-        count_gene_norm_method=model_config['data']['count_gene_norm_method'],
-        count_count_norm_method=model_config['data']['count_count_norm_method'],
+        rank_cell_norm_method=data_config['rank_cell_norm_method'],
+        rank_gene_norm_method=data_config['rank_gene_norm_method'],
+        rank_count_norm_method=data_config['rank_count_norm_method'],
+        count_cell_norm_method=data_config['count_cell_norm_method'],
+        count_gene_norm_method=data_config['count_gene_norm_method'],
+        count_count_norm_method=data_config['count_count_norm_method'],
         norm_factor_file_path=norm_factor_file_path,
         pf_targets_file_path=pf_targets_file_path,
         token_dictionary_file_path=token_dictionary_file_path,
         add_neigh_cell_ids=add_neigh_cell_ids,
-        include_special_tokens=include_special_tokens)
+        include_special_tokens=include_special_tokens,
+        **layout_kwargs)
     dataset_dict = tk._tokenize_adata(adata=adata)
     dataset = tk._create_dataset(
         dataset_dict=dataset_dict,
