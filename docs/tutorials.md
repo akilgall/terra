@@ -70,6 +70,15 @@ Adapt a Xenium-pretrained TERRA model to 10x Visium with LoRA fine-tuning,
 then embed new sections and recover cell types and states.
 :::
 
+:::{grid-item-card} {octicon}`database;1.5em;sd-mr-1` Exploring Tahoe-100M
+:link: notebooks/tahoe100m_exploration
+:link-type: doc
+
+Read a full local download of the Tahoe-100M drug-perturbation atlas: overview
+plots, cell selection by line, drug and dose, drug effects, and export for
+alignment fine-tuning.
+:::
+
 ::::
 
 ```{toctree}
@@ -84,4 +93,5 @@ notebooks/spatial_mapping_tutorial
 notebooks/supervised_finetuning
 notebooks/xenium_finetuning
 notebooks/visium_transfer_learning_tutorial
+notebooks/tahoe100m_exploration
 ```

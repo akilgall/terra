@@ -105,8 +105,6 @@ def _layout_overrides(args) -> dict:
 
 def prepare_tahoe(args) -> None:
     """Run the `tahoe` subcommand."""
-    from terra.inference.tokenize import tokenize_adata
-
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     gene_meta, sample_meta, cell_line_meta = _load_metadata(args.cache_dir)
@@ -122,19 +120,41 @@ def prepare_tahoe(args) -> None:
                 f"({int(adata.obs['is_control'].sum())} controls) to {out / 'tahoe.h5ad'}.")
     if args.stop_after == "anndata":
         return
-    with open(Path(args.model_dir) / "token_dictionary.pkl", "rb") as f:
+    write_tahoe_dataset(adata, args.model_dir, args.lineage_map, out, _layout_overrides(args))
+
+
+def write_tahoe_dataset(adata: ad.AnnData,
+                        model_dir: str | Path,
+                        lineage_map: str | Path,
+                        out: str | Path,
+                        data_overrides: dict | None = None,
+                        ) -> Path:
+    """
+    Tokenize Tahoe cells as labelled cell-only records for multi-stream fine-tuning.
+
+    Adds the `*_value` label columns. Writes `<out>/tahoe_ds` and `<out>/label_codes.json` (reuse the codes for
+    the spatial dataset); returns the dataset path. `adata` holds raw counts
+    with the obs of `convert.table_to_anndata`; `data_overrides` sets the
+    sequence layout (e.g. `seq_len_cell`, `seq_len_neigh`).
+    """
+    from terra.inference.tokenize import tokenize_adata
+
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    with open(Path(model_dir) / "token_dictionary.pkl", "rb") as f:
         adata = restrict_to_vocab(adata, pickle.load(f))
-    dataset = tokenize_adata(adata, args.model_dir, str(out / "cache"), nproc=1,
+    dataset = tokenize_adata(adata, str(model_dir), str(out / "cache"), nproc=1,
                              processing_mode="sequential", use_generator=False,
-                             cell_only=True, data_overrides=_layout_overrides(args))
-    lineage_map = load_lineage_map(args.lineage_map)
-    codes = LabelCodes.from_values(lineage_map, cell_lines=adata.obs["cell_line_id"],
+                             cell_only=True, data_overrides=data_overrides or {})
+    lineages = load_lineage_map(lineage_map)
+    codes = LabelCodes.from_values(lineages, cell_lines=adata.obs["cell_line_id"],
                                    drugs=adata.obs["drug"])
-    dataset = add_value_columns(dataset, adata.obs, codes, lineage_map, domain=DOMAIN_TAHOE,
+    dataset = add_value_columns(dataset, adata.obs, codes, lineages, domain=DOMAIN_TAHOE,
                                 lineage_column="organ", lineage_source="tahoe_organs")
     dataset.save_to_disk(str(out / "tahoe_ds"))
     codes.save(out / "label_codes.json")
     logger.info(f"Saved tokenized dataset to {out / 'tahoe_ds'}.")
+    return out / "tahoe_ds"
 
 
 def label_spatial(args) -> None:

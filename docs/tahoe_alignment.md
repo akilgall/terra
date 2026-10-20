@@ -85,6 +85,11 @@ python -m terra.tahoe.prepare tahoe --out tahoe_slice --model-dir $MODEL_DIR \
 
 It writes `tahoe.h5ad`, `selection.json`, `tahoe_ds` and `label_codes.json`.
 
+With a full local download, the
+{doc}`Tahoe-100M exploration notebook <notebooks/tahoe100m_exploration>` selects
+cells by organ, cell line, drug, dose and plate instead. It writes the same
+`tahoe_ds` and `label_codes.json` with `terra.tahoe.prepare.write_tahoe_dataset`.
+
 ## 3. Label the spatial dataset
 
 Map your cell types to the shared lineages in `configs/finetune/lineage_map.yaml` (add
